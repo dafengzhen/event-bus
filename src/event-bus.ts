@@ -14,21 +14,36 @@ import type {
 } from './types.ts';
 
 /**
- * EventBus.
+ * EventBus implementation with:
+ * - exact listeners
+ * - any listeners
+ * - pattern listeners
+ * - middleware support
  *
+ * @type E Event map
  * @author dafengzhen
  */
 export class EventBus<E extends EventMap> {
+  /** Listeners for all events */
   private anyListeners = new Set<AnyListener<E>>();
 
+  /** Exact listeners mapped by event name */
   private listenersByEvent = new Map<keyof E, Set<Listener<any>>>();
 
+  /** Global middlewares */
   private middlewares: Middleware<E>[] = [];
 
+  /** Pattern-specific middlewares */
   private patternMiddlewares: PatternMiddleware<E>[] = [];
 
+  /** Compiled pattern listeners */
   private patternListeners: CompiledPatternListener<E>[] = [];
 
+  /**
+   * Clear listeners.
+   *
+   * @param event If omitted, clears everything.
+   */
   clear(event?: keyof E): void {
     if (event === undefined) {
       this.listenersByEvent.clear();
@@ -42,11 +57,19 @@ export class EventBus<E extends EventMap> {
     this.listenersByEvent.delete(event);
   }
 
+  /**
+   * Register a listener for an event.
+   *
+   * @returns unsubscribe function
+   */
   on<K extends keyof E>(event: K, listener: Listener<E[K]>): () => void {
     this.getListenerSet(event).add(listener);
     return () => this.off(event, listener);
   }
 
+  /**
+   * Remove an event listener.
+   */
   off<K extends keyof E>(event: K, listener: Listener<E[K]>): void {
     const set = this.listenersByEvent.get(event);
     if (!set) {
@@ -59,6 +82,9 @@ export class EventBus<E extends EventMap> {
     }
   }
 
+  /**
+   * Register a listener that runs once.
+   */
   once<K extends keyof E>(event: K, listener: Listener<E[K]>): () => void {
     const off = this.on(event, ((payload: E[K]) => {
       off();
@@ -68,21 +94,33 @@ export class EventBus<E extends EventMap> {
     return off;
   }
 
+  /**
+   * Register a listener for all events.
+   */
   onAny(listener: AnyListener<E>): () => void {
     this.anyListeners.add(listener);
     return () => this.anyListeners.delete(listener);
   }
 
+  /**
+   * Register a global middleware.
+   */
   use(mw: Middleware<E>): () => void {
     this.middlewares.push(mw);
     return () => this.removeFromArray(this.middlewares, mw);
   }
 
+  /**
+   * Register a pattern middleware.
+   */
   usePattern(mw: PatternMiddleware<E>): () => void {
     this.patternMiddlewares.push(mw);
     return () => this.removeFromArray(this.patternMiddlewares, mw);
   }
 
+  /**
+   * Register a pattern listener.
+   */
   onPattern<P extends Pattern<Extract<keyof E, string>>>(
     pattern: P,
     handler: <K extends keyof E & MatchKeys<Extract<keyof E, string>, P>>(
@@ -112,6 +150,9 @@ export class EventBus<E extends EventMap> {
     return () => this.removeFromArray(this.patternListeners, entry);
   }
 
+  /**
+   * Register a one-time pattern listener.
+   */
   oncePattern<P extends Pattern<Extract<keyof E, string>>>(
     pattern: P,
     handler: <K extends keyof E & MatchKeys<Extract<keyof E, string>, P>>(
@@ -124,6 +165,9 @@ export class EventBus<E extends EventMap> {
     return this.onPattern(pattern, handler, { ...options, once: true });
   }
 
+  /**
+   * Count listeners for an event.
+   */
   listenerCount(event: keyof E): number {
     let count = 0;
     count += this.listenersByEvent.get(event)?.size ?? 0;
@@ -140,6 +184,9 @@ export class EventBus<E extends EventMap> {
     return count;
   }
 
+  /**
+   * Emit an event synchronously (errors rethrown async).
+   */
   emit<K extends keyof E>(event: K, ...args: E[K] extends void ? [] : [payload: E[K]]): void {
     void this._emit(event, ...args).catch((err) => {
       queueMicrotask(() => {
@@ -148,6 +195,9 @@ export class EventBus<E extends EventMap> {
     });
   }
 
+  /**
+   * Emit an event asynchronously.
+   */
   emitAsync<K extends keyof E>(
     event: K,
     ...args: E[K] extends void ? [] : [payload: E[K]]
@@ -155,6 +205,9 @@ export class EventBus<E extends EventMap> {
     return this._emit(event, ...args);
   }
 
+  /**
+   * Internal emit implementation.
+   */
   private async _emit<K extends keyof E>(
     event: K,
     ...args: E[K] extends void ? [] : [payload: E[K]]
