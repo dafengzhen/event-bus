@@ -4,11 +4,11 @@ export type Listener<Payload> = Payload extends void ? () => void : (payload: Pa
 
 export type AnyListener<E extends EventMap> = <K extends keyof E>(event: K, payload: E[K]) => void;
 
-export type PatternKind = 'star' | 'prefix' | 'param';
+export type PatternKind = 'star' | 'prefix' | 'param' | 'exact';
 
 export type Pattern<_K extends string> = '*' | `${string}:*` | `${string}{${string}}${string}`;
 
-type PatternToKeyShape<P extends string> = P extends '*'
+export type PatternToKeyShape<P extends string> = P extends '*'
   ? string
   : P extends `${infer Prefix}:*`
     ? `${Prefix}:${string}` | Prefix

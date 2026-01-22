@@ -94,12 +94,16 @@ export class EventBus<E extends EventMap> {
   ): () => void {
     const compiled = this.compilePatternMatcher(pattern);
 
+    const prefix =
+      typeof pattern === 'string' && pattern.endsWith(':*') ? pattern.slice(0, -2) : undefined;
+
     const entry: CompiledPatternListener<E> = {
       pattern,
       kind: compiled.kind,
       match: compiled.match,
       priority: options?.priority ?? compiled.priority,
       once: options?.once,
+      prefix,
       handler: handler as any,
     };
 
@@ -127,7 +131,7 @@ export class EventBus<E extends EventMap> {
 
     if (typeof event === 'string') {
       for (const p of this.patternListeners) {
-        if (p.match(event)) {
+        if (p.match(event) !== null) {
           count++;
         }
       }
@@ -191,8 +195,7 @@ export class EventBus<E extends EventMap> {
 
       const mw = this.middlewares[n];
       if (!mw) {
-        this.invokeExactAndAnyListeners(ctx.event, ctx.payload);
-        await this.invokePatternPipeline(ctx);
+        await this.invokeUnifiedDispatch(ctx);
         return;
       }
       await mw(ctx, () => dispatch(n + 1));
@@ -201,27 +204,14 @@ export class EventBus<E extends EventMap> {
     await dispatch(0);
   }
 
-  private invokeExactAndAnyListeners<K extends keyof E>(event: K, payload: E[K]): void {
-    const set = this.listenersByEvent.get(event);
-    if (set) {
-      for (const fn of set) {
-        this.safeCall(() => fn(payload));
-      }
-    }
-
-    for (const fn of this.anyListeners) {
-      this.safeCall(() => fn(event, payload));
-    }
-  }
-
-  private async invokePatternPipeline(ctx: EmitContext<E, keyof E>): Promise<void> {
+  private async invokeUnifiedDispatch(ctx: EmitContext<E, keyof E>): Promise<void> {
     const matched: Array<{ entry: CompiledPatternListener<E>; params: Record<string, string> }> =
       [];
 
     if (typeof ctx.event === 'string') {
       for (const entry of this.patternListeners) {
         const params = entry.match(ctx.event);
-        if (params) {
+        if (params !== null) {
           matched.push({ entry, params });
         }
       }
@@ -240,6 +230,10 @@ export class EventBus<E extends EventMap> {
     let index = -1;
 
     const dispatch = async (n: number): Promise<void> => {
+      if (ctx.blocked) {
+        return;
+      }
+
       if (n <= index) {
         throw new Error('next() called multiple times.');
       }
@@ -247,7 +241,12 @@ export class EventBus<E extends EventMap> {
 
       const mw = this.patternMiddlewares[n];
       if (!mw) {
+        this.invokeExactAndAnyListeners(ctx.event, ctx.payload);
+
         for (const { entry, params } of matched) {
+          if (ctx.blocked) {
+            return;
+          }
           this.safeCall(() => entry.handler(ctx.event, ctx.payload, params));
           if (entry.once) {
             this.removeFromArray(this.patternListeners, entry);
@@ -260,6 +259,19 @@ export class EventBus<E extends EventMap> {
     };
 
     await dispatch(0);
+  }
+
+  private invokeExactAndAnyListeners<K extends keyof E>(event: K, payload: E[K]): void {
+    const set = this.listenersByEvent.get(event);
+    if (set) {
+      for (const fn of set) {
+        this.safeCall(() => fn(payload));
+      }
+    }
+
+    for (const fn of this.anyListeners) {
+      this.safeCall(() => fn(event, payload));
+    }
   }
 
   private getListenerSet<K extends keyof E>(event: K): Set<Listener<E[K]>> {
@@ -368,6 +380,10 @@ export class EventBus<E extends EventMap> {
       };
     }
 
-    throw new Error(`Unsupported pattern: ${p}.`);
+    return {
+      kind: 'exact',
+      priority: 10_000,
+      match: (event: string) => (event === p ? {} : null),
+    };
   }
 }
