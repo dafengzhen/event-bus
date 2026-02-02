@@ -12,7 +12,7 @@ bus.on('user.created', async (payload) => {
   console.log(payload);
 });
 
-bus.onPattern('*', async (payload) => {
+bus.onPattern('**', async (payload) => {
   console.log('any user event', payload);
 });
 

@@ -101,11 +101,11 @@ describe('EventBus', () => {
     expect(handler).toHaveBeenCalledWith('order:create', { orderId: 42 });
   });
 
-  test("onPattern('*'): should receive all events, and unsubscribe works", async () => {
+  test("onPattern('**'): should receive all events, and unsubscribe works", async () => {
     const { bus } = setup();
     const handler = jest.fn();
 
-    const off = bus.onPattern('*', handler);
+    const off = bus.onPattern('**', handler);
 
     bus.emit('user:create', { id: 'u1' });
     bus.emit('order:create', { orderId: 1 });
@@ -158,7 +158,7 @@ describe('EventBus', () => {
     bus.on('user:create', () => steps.push('handler'));
 
     bus.emit('user:create', { id: 'u1' });
-    await flush(2);
+    await flush(3);
 
     expect(steps).toEqual(['mw1:before', 'mw2:before', 'handler', 'mw2:after', 'mw1:after']);
   });
@@ -245,7 +245,7 @@ describe('EventBus', () => {
 
     bus.on('user:create', exact);
     bus.onAny(any);
-    bus.onPattern('*', star);
+    bus.onPattern('**', star);
     bus.onPattern('user:*', prefix);
 
     bus.clear('user:create');

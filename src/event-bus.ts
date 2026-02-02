@@ -1,12 +1,11 @@
 import type {
   AnyListener,
   CompiledPatternListener,
+  CompiledSeg,
   EmitContext,
   EventMap,
   Listener,
-  MatchKeys,
   Middleware,
-  Pattern,
   PatternKind,
   PatternListenerInfo,
   PatternMiddleware,
@@ -14,35 +13,72 @@ import type {
 } from './types.ts';
 
 /**
- * EventBus implementation with:
- * - exact listeners
- * - any listeners
- * - pattern listeners
- * - middleware support
+ * A strongly-typed EventBus supporting:
  *
- * @type E Event map
+ * - Exact event listeners (`on`, `once`)
+ * - Global listeners (`onAny`)
+ * - Pattern listeners (`onPattern`, `oncePattern`)
+ * - Global middleware & pattern middleware
+ *
+ * Pattern syntax (separator defaults to `:`):
+ * - `*`      → single-segment wildcard
+ * - `**`     → deep wildcard (matches 0..n segments)
+ * - `{name}` → named parameter segment
+ * - `?`      → single-character wildcard within a segment (regex-like)
+ *
+ * Error handling:
+ * - Listener errors are rethrown asynchronously via `queueMicrotask`,
+ *   so they don't break the current emit loop.
+ *
+ * Emit modes:
+ * - `emit()`     : fire-and-forget (async errors rethrown)
+ * - `emitAsync()`: await completion of middleware + listeners
+ *
+ * @example
+ * ```ts
+ * type Events = {
+ *   'user:login': { id: string };
+ *   'user:logout': void;
+ * };
+ *
+ * const bus = new EventBus<Events>();
+ *
+ * bus.on('user:login', (p) => console.log(p.id));
+ * bus.onPattern('user:{action}', (evt, payload, params) => {
+ *   console.log(evt, params?.action);
+ * });
+ *
+ * bus.emit('user:login', { id: '42' });
+ * ```
+ *
  * @author dafengzhen
  */
 export class EventBus<E extends EventMap> {
-  /** Listeners for all events */
+  /** Listeners that receive all events */
   private anyListeners = new Set<AnyListener<E>>();
 
   /** Exact listeners mapped by event name */
   private listenersByEvent = new Map<keyof E, Set<Listener<any>>>();
 
-  /** Global middlewares */
+  /** Global middleware chain (runs on every emit) */
   private middlewares: Middleware<E>[] = [];
 
-  /** Pattern-specific middlewares */
+  /**
+   * Pattern-specific middleware chain.
+   * Only runs when there is at least one matched pattern listener for the emitted event.
+   */
   private patternMiddlewares: PatternMiddleware<E>[] = [];
 
-  /** Compiled pattern listeners */
+  /** Compiled pattern listeners, sorted by priority (descending) */
   private patternListeners: CompiledPatternListener<E>[] = [];
 
+  /** Cache for compiled patterns (pattern + separator) */
+  private patternCache = new Map<string, ReturnType<EventBus<E>['compilePattern']>>();
+
   /**
-   * Clear listeners.
-   *
-   * @param event If omitted, clears everything.
+   * Clear listeners and middleware.
+   * - If `event` is omitted, clears everything (exact/any/pattern listeners + middleware + cache).
+   * - If `event` is provided, only clears exact listeners of that event.
    */
   clear(event?: keyof E): void {
     if (event === undefined) {
@@ -51,16 +87,15 @@ export class EventBus<E extends EventMap> {
       this.patternListeners.length = 0;
       this.middlewares.length = 0;
       this.patternMiddlewares.length = 0;
+      this.patternCache.clear();
       return;
     }
-
     this.listenersByEvent.delete(event);
   }
 
   /**
-   * Register a listener for an event.
-   *
-   * @returns unsubscribe function
+   * Register an exact listener for a specific event.
+   * @returns Unsubscribe function
    */
   on<K extends keyof E>(event: K, listener: Listener<E[K]>): () => void {
     this.getListenerSet(event).add(listener);
@@ -68,7 +103,7 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Remove an event listener.
+   * Remove an exact event listener (no-op if missing).
    */
   off<K extends keyof E>(event: K, listener: Listener<E[K]>): void {
     const set = this.listenersByEvent.get(event);
@@ -83,19 +118,21 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Register a listener that runs once.
+   * Register an exact listener that runs only once.
+   * @returns Unsubscribe function (still works before the first run)
    */
   once<K extends keyof E>(event: K, listener: Listener<E[K]>): () => void {
-    const off = this.on(event, ((payload: E[K]) => {
-      off();
+    const wrapper = ((payload: E[K]) => {
       listener(payload);
-    }) as Listener<E[K]>);
+      this.off(event, wrapper);
+    }) as Listener<E[K]>;
 
-    return off;
+    return this.on(event, wrapper);
   }
 
   /**
-   * Register a listener for all events.
+   * Register a listener that receives all events.
+   * @returns Unsubscribe function
    */
   onAny(listener: AnyListener<E>): () => void {
     this.anyListeners.add(listener);
@@ -103,7 +140,32 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Register a global middleware.
+   * Remove a global (any) listener (no-op if missing).
+   */
+  offAny(listener: AnyListener<E>): void {
+    this.anyListeners.delete(listener);
+  }
+
+  /**
+   * Register a global (any) listener that runs only once.
+   * @returns Unsubscribe function (still works before the first run)
+   */
+  onceAny(listener: AnyListener<E>): () => void {
+    const wrapper: AnyListener<E> = (event, payload) => {
+      listener(event, payload);
+      this.offAny(wrapper);
+    };
+
+    return this.onAny(wrapper);
+  }
+
+  /**
+   * Register a global middleware (runs on every emit).
+   *
+   * Middleware must call `next()` exactly once to continue.
+   * If it never calls `next()`, dispatch stops.
+   *
+   * @returns Unsubscribe function
    */
   use(mw: Middleware<E>): () => void {
     this.middlewares.push(mw);
@@ -111,7 +173,15 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Register a pattern middleware.
+   * Register a pattern-specific middleware.
+   *
+   * Only invoked when there is at least one matched pattern listener.
+   *
+   * Gate semantics:
+   * - If a pattern middleware does not call `next()`, dispatch stops (acts like a guard).
+   * - `next()` must be called exactly once.
+   *
+   * @returns Unsubscribe function
    */
   usePattern(mw: PatternMiddleware<E>): () => void {
     this.patternMiddlewares.push(mw);
@@ -120,20 +190,35 @@ export class EventBus<E extends EventMap> {
 
   /**
    * Register a pattern listener.
+   *
+   * Supported syntax (separator defaults to `:`):
+   * - `*`      → single-segment wildcard
+   * - `**`     → deep wildcard (matches 0..n segments)
+   * - `{param}`→ named parameter segment
+   * - `?`      → single-character wildcard inside a segment
+   *
+   * Priority:
+   * - If `options.priority` is provided, it overrides auto-derived priority.
+   * - Higher priority runs earlier.
+   *
+   * @param pattern Pattern string
+   * @param handler Callback invoked when pattern matches
+   * @param options Pattern options
+   * @returns Unsubscribe function
    */
-  onPattern<P extends Pattern<Extract<keyof E, string>>>(
-    pattern: P,
-    handler: <K extends keyof E & MatchKeys<Extract<keyof E, string>, P>>(
-      event: K,
-      payload: E[K],
-      params?: Record<string, string>,
-    ) => void,
+  onPattern(
+    pattern: string,
+    handler: (event: keyof E, payload: E[keyof E], params?: Record<string, string>) => void,
     options?: PatternOptions,
   ): () => void {
-    const compiled = this.compilePatternMatcher(pattern);
+    const sep = options?.separator ?? ':';
+    const cacheKey = `${pattern}|${sep}`;
 
-    const prefix =
-      typeof pattern === 'string' && pattern.endsWith(':*') ? pattern.slice(0, -2) : undefined;
+    let compiled = this.patternCache.get(cacheKey);
+    if (!compiled) {
+      compiled = this.compilePattern(pattern, sep);
+      this.patternCache.set(cacheKey, compiled);
+    }
 
     const entry: CompiledPatternListener<E> = {
       pattern,
@@ -141,39 +226,39 @@ export class EventBus<E extends EventMap> {
       match: compiled.match,
       priority: options?.priority ?? compiled.priority,
       once: options?.once,
-      prefix,
       handler: handler as any,
     };
 
     this.insertPatternByPriority(entry);
-
     return () => this.removeFromArray(this.patternListeners, entry);
   }
 
   /**
    * Register a one-time pattern listener.
+   * @returns Unsubscribe function
    */
-  oncePattern<P extends Pattern<Extract<keyof E, string>>>(
-    pattern: P,
-    handler: <K extends keyof E & MatchKeys<Extract<keyof E, string>, P>>(
-      event: K,
-      payload: E[K],
-      params?: Record<string, string>,
-    ) => void,
+  oncePattern(
+    pattern: string,
+    handler: (event: keyof E, payload: E[keyof E], params?: Record<string, string>) => void,
     options?: Omit<PatternOptions, 'once'>,
   ): () => void {
     return this.onPattern(pattern, handler, { ...options, once: true });
   }
 
   /**
-   * Count listeners for an event.
+   * Count listeners matching the event.
+   *
+   * Includes:
+   * - Exact listeners for `event`
+   * - Global `onAny` listeners
+   * - Pattern listeners that match (only when `event` is a string)
    */
   listenerCount(event: keyof E): number {
     let count = 0;
     count += this.listenersByEvent.get(event)?.size ?? 0;
     count += this.anyListeners.size;
 
-    if (typeof event === 'string') {
+    if (typeof event === 'string' && this.patternListeners.length) {
       for (const p of this.patternListeners) {
         if (p.match(event) !== null) {
           count++;
@@ -185,35 +270,38 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Emit an event synchronously (errors rethrown async).
+   * Emit an event synchronously (fire-and-forget).
+   *
+   * - Execution is async internally, but this method does not await.
+   * - Listener errors are rethrown asynchronously.
    */
   emit<K extends keyof E>(event: K, ...args: E[K] extends void ? [] : [payload: E[K]]): void {
-    void this._emit(event, ...args).catch((err) => {
-      queueMicrotask(() => {
-        throw err;
-      });
-    });
+    if (this.listenerCount(event) === 0) {
+      return;
+    }
+
+    this._emit(event, ...args).catch((err) => this.rethrowAsync(err));
   }
 
   /**
    * Emit an event asynchronously.
+   * Resolves when middleware + listeners have finished.
    */
-  emitAsync<K extends keyof E>(
+  async emitAsync<K extends keyof E>(
     event: K,
     ...args: E[K] extends void ? [] : [payload: E[K]]
   ): Promise<void> {
-    return this._emit(event, ...args);
+    if (this.listenerCount(event) === 0) {
+      return;
+    }
+    await this._emit(event, ...args);
   }
 
-  /**
-   * Internal emit implementation.
-   */
   private async _emit<K extends keyof E>(
     event: K,
     ...args: E[K] extends void ? [] : [payload: E[K]]
   ): Promise<void> {
     const payload = args[0] as E[K];
-
     let blocked = false;
 
     const ctx: EmitContext<E, K> = {
@@ -233,85 +321,109 @@ export class EventBus<E extends EventMap> {
   }
 
   private async runMiddlewares<K extends keyof E>(ctx: EmitContext<E, K>): Promise<void> {
-    let index = -1;
+    const mws = this.middlewares;
+    let i = 0;
 
-    const dispatch = async (n: number): Promise<void> => {
+    const next = async (): Promise<void> => {
       if (ctx.blocked) {
         return;
       }
 
-      if (n <= index) {
-        throw new Error('next() called multiple times.');
-      }
-
-      index = n;
-
-      const mw = this.middlewares[n];
-      if (!mw) {
+      if (i >= mws.length) {
         await this.invokeUnifiedDispatch(ctx);
         return;
       }
-      await mw(ctx, () => dispatch(n + 1));
+
+      const mw = mws[i++];
+      let nextCalled = false;
+
+      await mw(ctx, async () => {
+        if (nextCalled) {
+          throw new Error('next() called multiple times.');
+        }
+        nextCalled = true;
+        await next();
+      });
     };
 
-    await dispatch(0);
+    await next();
   }
 
   private async invokeUnifiedDispatch(ctx: EmitContext<E, keyof E>): Promise<void> {
-    const matched: Array<{ entry: CompiledPatternListener<E>; params: Record<string, string> }> =
-      [];
+    const { event, payload } = ctx;
 
-    if (typeof ctx.event === 'string') {
-      for (const entry of this.patternListeners) {
-        const params = entry.match(ctx.event);
-        if (params !== null) {
-          matched.push({ entry, params });
+    const matched =
+      typeof event === 'string' && this.patternListeners.length
+        ? this.matchPatternListeners(event)
+        : [];
+
+    // expose matched info for middleware / debugging
+    (ctx as any).matched = Object.freeze(
+      matched.map(
+        ({ entry, params }): PatternListenerInfo<E> => ({
+          pattern: entry.pattern,
+          kind: entry.kind,
+          once: entry.once,
+          priority: entry.priority,
+          params: Object.freeze({ ...params }),
+          handler: entry.handler,
+        }),
+      ),
+    );
+
+    // pattern middleware only runs if there are matches
+    if (matched.length && this.patternMiddlewares.length) {
+      for (let i = 0; i < this.patternMiddlewares.length; i++) {
+        if (ctx.blocked) {
+          return;
+        }
+
+        let nextCalled = false;
+        const mw = this.patternMiddlewares[i];
+
+        await mw(ctx, async () => {
+          if (nextCalled) {
+            throw new Error('next() called multiple times.');
+          }
+          nextCalled = true;
+        });
+
+        // guard: if not calling next, stop dispatch
+        if (!nextCalled) {
+          return;
         }
       }
     }
 
-    (ctx as any).matched = matched.map(
-      (m): PatternListenerInfo<E> => ({
-        handler: m.entry.handler,
-        kind: m.entry.kind,
-        once: m.entry.once,
-        priority: m.entry.priority,
-        prefix: m.entry.prefix,
-      }),
-    );
+    // exact + any first (保持你原来的语义)
+    this.invokeExactAndAnyListeners(event, payload);
 
-    let index = -1;
-
-    const dispatch = async (n: number): Promise<void> => {
+    // pattern handlers by priority
+    for (const { entry, params } of matched) {
       if (ctx.blocked) {
         return;
       }
 
-      if (n <= index) {
-        throw new Error('next() called multiple times.');
+      this.safeCall(() => entry.handler(event, payload, params));
+
+      if (entry.once) {
+        this.removeFromArray(this.patternListeners, entry);
       }
-      index = n;
+    }
+  }
 
-      const mw = this.patternMiddlewares[n];
-      if (!mw) {
-        this.invokeExactAndAnyListeners(ctx.event, ctx.payload);
+  private matchPatternListeners(event: string) {
+    const matches: Array<{ entry: CompiledPatternListener<E>; params: Record<string, string> }> =
+      [];
 
-        for (const { entry, params } of matched) {
-          if (ctx.blocked) {
-            return;
-          }
-          this.safeCall(() => entry.handler(ctx.event, ctx.payload, params));
-          if (entry.once) {
-            this.removeFromArray(this.patternListeners, entry);
-          }
-        }
-        return;
+    for (const entry of this.patternListeners) {
+      const params = entry.match(event);
+      if (params !== null) {
+        matches.push({ entry, params });
       }
+    }
 
-      await mw(ctx, () => dispatch(n + 1));
-    };
-
-    await dispatch(0);
+    return matches;
   }
 
   private invokeExactAndAnyListeners<K extends keyof E>(event: K, payload: E[K]): void {
@@ -337,19 +449,23 @@ export class EventBus<E extends EventMap> {
   }
 
   private insertPatternByPriority(entry: CompiledPatternListener<E>): void {
+    const arr = this.patternListeners;
+    const { priority } = entry;
+
+    // binary insert (descending)
     let lo = 0;
-    let hi = this.patternListeners.length;
+    let hi = arr.length;
 
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.patternListeners[mid].priority >= entry.priority) {
+      if (arr[mid].priority >= priority) {
         lo = mid + 1;
       } else {
         hi = mid;
       }
     }
 
-    this.patternListeners.splice(lo, 0, entry);
+    arr.splice(lo, 0, entry);
   }
 
   private removeFromArray<T>(arr: T[], item: T): void {
@@ -363,80 +479,133 @@ export class EventBus<E extends EventMap> {
     try {
       fn();
     } catch (err) {
-      queueMicrotask(() => {
-        throw err;
-      });
+      this.rethrowAsync(err);
     }
   }
 
-  private escapeRegexLiteral(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  private rethrowAsync(err: unknown): void {
+    queueMicrotask(() => {
+      throw err;
+    });
   }
 
-  private compilePatternMatcher(p: string): {
-    kind: PatternKind;
-    priority: number;
-    match: (event: string) => null | Record<string, string>;
-  } {
-    if (p === '*') {
-      return { kind: 'star', priority: 0, match: () => ({}) };
-    }
-
-    if (p.endsWith(':*')) {
-      const prefix = p.slice(0, -2);
-      if (!prefix) {
-        throw new Error(`Invalid pattern: ${p}.`);
-      }
-
-      const prefixWithColon = prefix + ':';
-
+  /**
+   * Compile a pattern into a matcher.
+   *
+   * Notes:
+   * - `**` as a segment means "match 0..n segments" (deep wildcard).
+   * - `*`  as a segment means "match exactly 1 segment".
+   * - If the whole pattern is exactly `"**"`, it matches any event (including empty params).
+   */
+  private compilePattern(pattern: string, sep: string) {
+    // Whole-pattern deep wildcard: match everything
+    if (pattern === '**') {
       return {
-        kind: 'prefix',
-        priority: 10,
-        match: (event: string) =>
-          event === prefix || event.startsWith(prefixWithColon) ? {} : null,
+        kind: 'wildcard' as const,
+        priority: -100,
+        match: () => ({}) as Record<string, string>,
       };
     }
 
-    if (p.includes('{')) {
-      const keys: string[] = [];
-      const parts = p.split(/\{(\w+)}/g);
+    const pSegs = pattern.split(sep);
+    const keys: string[] = [];
+    let score = 0;
 
-      let src = '^';
-      for (let i = 0; i < parts.length; i++) {
-        if (i % 2 === 0) {
-          src += this.escapeRegexLiteral(parts[i]);
-        } else {
-          keys.push(parts[i]);
-          src += '([^:]+)';
+    const compiled: CompiledSeg[] = pSegs.map((seg) => {
+      if (seg === '**') {
+        score -= 5;
+        return { type: 'deepWildcard' as const };
+      }
+
+      if (seg === '*') {
+        score -= 1;
+        return { type: 'wildcard' as const };
+      }
+
+      if (seg.startsWith('{') && seg.endsWith('}')) {
+        const key = seg.slice(1, -1);
+        keys.push(key);
+        score += 10;
+        return { type: 'param' as const, key };
+      }
+
+      if (seg.includes('?')) {
+        // escape then replace ? with single-char wildcard
+        const re = new RegExp(
+          '^' + seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\?/g, '.') + '$',
+        );
+        score += 5;
+        return { type: 'regex' as const, re };
+      }
+
+      score += 100;
+      return { type: 'exact' as const, value: seg };
+    });
+
+    let kind: PatternKind = 'exact';
+    if (keys.length) {
+      kind = 'param';
+    } else if (compiled.some((s) => s.type !== 'exact')) {
+      kind = 'wildcard';
+    }
+
+    function match(event: string) {
+      const eSegs = event.split(sep);
+      const params: Record<string, string> = {};
+
+      let i = 0; // pattern index
+      let j = 0; // event index
+
+      // backtracking position for deepWildcard (**)
+      let starI = -1;
+      let starJ = -1;
+
+      while (j < eSegs.length) {
+        const p = compiled[i];
+
+        if (p) {
+          if (p.type === 'deepWildcard') {
+            // ** can match empty; remember and advance pattern
+            starI = i++;
+            starJ = j;
+            continue;
+          }
+
+          // one segment match
+          if (
+            p.type === 'wildcard' ||
+            (p.type === 'exact' && p.value === eSegs[j]) ||
+            (p.type === 'regex' && p.re.test(eSegs[j])) ||
+            (p.type === 'param' && ((params[p.key] = eSegs[j]), true))
+          ) {
+            i++;
+            j++;
+            continue;
+          }
         }
+
+        // mismatch: if we had a ** before, backtrack to let ** consume one more segment
+        if (starI !== -1) {
+          i = starI + 1;
+          j = ++starJ;
+          continue;
+        }
+
+        return null;
       }
-      src += '$';
 
-      const regex = new RegExp(src);
+      // event ended; remaining pattern segments must be ** to match empty
+      while (compiled[i]?.type === 'deepWildcard') {
+        i++;
+      }
 
-      return {
-        kind: 'param',
-        priority: 100 + keys.length,
-        match: (event: string) => {
-          const m = event.match(regex);
-          if (!m) {
-            return null;
-          }
-
-          const params: Record<string, string> = {};
-          for (let i = 0; i < keys.length; i++) {
-            params[keys[i]] = m[i + 1];
-          }
-          return params;
-        },
-      };
+      return i === compiled.length ? params : null;
     }
 
     return {
-      kind: 'exact',
-      priority: 10_000,
-      match: (event: string) => (event === p ? {} : null),
+      kind,
+      priority: score,
+      match,
     };
   }
 }
