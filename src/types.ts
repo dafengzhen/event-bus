@@ -18,7 +18,7 @@
  * };
  * ```
  */
-export type EventMap = Record<string, unknown>;
+export type EventMap = Record<string, any>;
 
 /**
  * Listener type for a specific payload.
