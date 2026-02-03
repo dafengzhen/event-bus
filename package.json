@@ -1,6 +1,6 @@
 {
   "name": "@dafengzhen/event-bus",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "A lightweight TypeScript event bus with strong typing, middleware pipeline, and pattern-based event listeners.",
   "keywords": [
     "event-bus",
@@ -23,21 +23,27 @@
     "type": "git",
     "url": "git+https://github.com/dafengzhen/event-bus.git"
   },
-  "source": "./src/index.ts",
   "files": [
     "dist"
   ],
   "type": "module",
+  "main": "./dist/cjs/modern/index.js",
+  "module": "./dist/esm/modern/index.js",
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/types/index.d.ts",
       "import": "./dist/esm/modern/index.js",
-      "require": "./dist/cjs/modern/index.js"
+      "require": "./dist/cjs/modern/index.js",
+      "default": "./dist/esm/modern/index.js"
     }
   },
   "scripts": {
-    "build": "parcel build",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build:modern": "parcel build src/index.ts --target modern-esm --target modern-cjs",
+    "build:legacy": "parcel build src/index.ts --target legacy-esm --target legacy-cjs",
+    "build:dev": "parcel build src/index.ts --target modern-esm-dev --target modern-cjs-dev --target legacy-esm-dev --target legacy-cjs-dev",
+    "build": "npm run build:types && npm run build:modern && npm run build:legacy && npm run build:dev",
     "prepare": "husky install",
     "test": "jest",
     "watch": "parcel watch",
