@@ -395,7 +395,7 @@ export class EventBus<E extends EventMap> {
       }
     }
 
-    // exact + any first (保持你原来的语义)
+    // exact + any first
     this.invokeExactAndAnyListeners(event, payload);
 
     // pattern handlers by priority
