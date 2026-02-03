@@ -1,2 +1,2 @@
+export type * from './types.ts';
 export * from './event-bus.ts';
-export * from './types.ts';
