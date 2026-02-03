@@ -1,8 +1,7 @@
-import type { Types } from '../src/index.ts';
-
+import type { EventMap } from '../src/index.ts';
 import { EventBus } from '../src/index.ts';
 
-type MyEvents = Types.EventMap & {
+type MyEvents = EventMap & {
   orderPlaced: { amount: number; id: string };
   userCreated: { id: string; name: string };
 };
