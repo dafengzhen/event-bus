@@ -1,6 +1,6 @@
 {
   "name": "@dafengzhen/event-bus",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A lightweight TypeScript event bus with strong typing, middleware pipeline, and pattern-based event listeners.",
   "keywords": [
     "event-bus",
@@ -31,12 +31,9 @@
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
-      "import": {
-        "default": "./dist/esm/modern/index.js"
-      },
-      "require": {
-        "default": "./dist/cjs/modern/index.js"
-      }
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/modern/index.js",
+      "require": "./dist/cjs/modern/index.js"
     }
   },
   "scripts": {
