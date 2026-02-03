@@ -1,4 +1,2 @@
-import { EventBus } from './event-bus.ts';
-import * as Types from './types.ts';
-
-export { EventBus, Types };
+export * from './event-bus.ts';
+export * from './types.ts';
