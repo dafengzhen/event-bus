@@ -1,7 +1,6 @@
-import type { EventMap } from '../src/index.ts';
 import { EventBus } from '../src/index.ts';
 
-type Events = EventMap & {
+type Events = {
   'order.created': { orderId: string };
   'user.created': { id: string };
   'user.deleted': { id: string };
@@ -13,9 +12,13 @@ bus.on('user.created', async (payload) => {
   console.log(payload);
 });
 
-bus.onPattern('**', async (payload) => {
-  console.log('any user event', payload);
-});
+bus.on(
+  '**',
+  async (payload) => {
+    console.log('any user event', payload);
+  },
+  { pattern: true },
+);
 
 bus.use(async (ctx, next) => {
   const start = Date.now();

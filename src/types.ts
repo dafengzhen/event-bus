@@ -1,320 +1,274 @@
 /**
- * Event map definition.
+ * A map of event keys to payload types.
  *
- * A mapping from **event name** to **payload type**.
- *
- * - **Key**: event name (string literal recommended)
- * - **Value**: payload type for that event
- *
- * Notes:
- * - Event names are typically namespaced strings, e.g. `user:login`, `order:created`.
- * - Payload can be `void` for events without payload.
+ * Use this to strongly type event names and their payload shapes:
  *
  * @example
  * ```ts
- * type MyEvents = {
+ * type Events = {
  *   'user:login': { id: string };
  *   'user:logout': void;
  * };
  * ```
  */
-export type EventMap = Record<string, any>;
+export type EventMap = Record<PropertyKey, any>;
 
 /**
- * Listener type for a specific payload.
- *
- * If the payload is `void`, the listener receives **no arguments**.
- * Otherwise, it receives **exactly one argument**: the payload.
- *
- * This enables strict typing for both forms:
- *
- * @example
- * ```ts
- * on('ready', () => {});
- * on('data', (payload) => {
- *   console.log(payload);
- * });
- * ```
+ * A listener for exact events.
  */
-export type Listener<Payload> = Payload extends void ? () => void : (payload: Payload) => void;
+export type Listener<T> = (payload: T) => void;
 
 /**
- * Listener that receives **all emitted events**.
+ * The category of a compiled pattern.
  *
- * It receives:
- * - `event`: the event name
- * - `payload`: the payload associated with that event
- *
- * Typical use cases:
- * - logging / debugging
- * - analytics / tracing
- * - building devtools
- *
- * @example
- * ```ts
- * const off = bus.onAny((event, payload) => {
- *   console.log('event=', event, 'payload=', payload);
- * });
- * off();
- * ```
+ * - `exact`: contains only literal segments (no wildcards, no params)
+ * - `param`: contains parameter segments like `{id}`
+ * - `wildcard`: contains `*` and/or `**`
  */
-export type AnyListener<E extends EventMap> = <K extends keyof E>(event: K, payload: E[K]) => void;
+export type PatternKind = 'exact' | 'param' | 'wildcard';
 
 /**
- * Pattern matching strategy used by a pattern listener.
+ * A compiled pattern segment.
  *
- * - `exact`    → exact segment match (no wildcards / params)
- * - `wildcard` → contains wildcards (e.g. `*`, `**`, `?`)
- * - `param`    → contains named params (e.g. `{id}`)
- *
- * Notes:
- * - These are informational categories; the actual matching is implemented by the EventBus.
+ * - `exact`: literal match (segment must equal `value`)
+ * - `param`: captures the segment under `key`
+ * - `wildcard`: matches exactly one segment (`*`)
+ * - `deepWildcard`: matches zero or more segments (`**`)
  */
-export type PatternKind = 'exact' | 'wildcard' | 'param';
+export type CompiledSeg =
+  | { type: 'exact'; value: string }
+  | { type: 'param'; key: string }
+  | { type: 'wildcard' }
+  | { type: 'deepWildcard' };
 
 /**
- * Context object passed through the emit lifecycle.
+ * Metadata describing a pattern listener match for a single emit.
  *
- * This context is shared across:
- * - global middleware
- * - pattern middleware
- * - dispatch logic
- *
- * It allows middleware to:
- * - observe the event and payload
- * - attach metadata (`meta`)
- * - stop propagation (`block()`)
+ * This is provided to middleware via `ctx.matched` (read-only),
+ * so middleware can inspect what will be dispatched (patterns, params, etc.).
+ */
+export type PatternListenerInfo<E extends EventMap> = {
+  /** The original pattern string as registered by the user. */
+  pattern: string;
+
+  /** The computed pattern kind. */
+  kind: PatternKind;
+
+  /** Whether this listener will auto-unsubscribe after being invoked once. */
+  once?: boolean;
+
+  /**
+   * Listener priority. Higher priority listeners are dispatched earlier.
+   *
+   * If not explicitly specified, this typically derives from the pattern specificity
+   * (more exact segments => higher default priority).
+   */
+  priority: number;
+
+  /**
+   * Captured parameters for this match (e.g. `{id}` -> `params.id`).
+   *
+   * This object is frozen in the emit context.
+   */
+  params: Readonly<Record<string, string>>;
+
+  /**
+   * The registered handler.
+   *
+   * @param event - The actual emitted event key.
+   * @param payload - The emitted payload.
+   * @param params - Captured parameters (if any).
+   */
+  handler: (event: keyof E, payload: E[keyof E], params?: Record<string, string>) => void;
+};
+
+/**
+ * Context object passed through middleware and used during dispatch.
  */
 export type EmitContext<E extends EventMap, K extends keyof E> = {
   /**
    * Whether propagation has been blocked.
    *
-   * Once `true`, dispatch stops and no further middleware/listeners should run.
+   * Once blocked, remaining middleware and pattern dispatch steps will stop.
    */
   readonly blocked: boolean;
 
-  /**
-   * Current emitted event name.
-   */
+  /** The emitted event key. */
   readonly event: K;
 
-  /**
-   * Payload associated with the event.
-   *
-   * If the event's payload type is `void`, this value is typically `undefined`
-   * (depending on the emitter implementation).
-   */
+  /** The emitted payload. */
   readonly payload: E[K];
 
   /**
-   * Information about matched pattern listeners for this emit cycle.
+   * A read-only list of pattern listener matches for this emit.
    *
-   * - Ordered by priority (highest first).
-   * - Empty if no pattern listeners matched (or pattern matching not applicable).
-   *
-   * Useful for middleware that wants to inspect or audit matches.
+   * Each entry includes the pattern, kind, priority, captured params, and handler reference.
    */
-  readonly matched: readonly PatternListenerInfo<E>[];
+  readonly matched: ReadonlyArray<PatternListenerInfo<E>>;
 
   /**
-   * Free-form metadata container shared across middleware.
+   * Arbitrary mutable metadata bag for middlewares to share information.
    *
-   * Use this to pass state between middleware, e.g.:
-   * - correlation IDs
-   * - timing info
-   * - auth decisions
-   *
-   * Note: Consumers should avoid putting large objects here in hot paths.
+   * This is not frozen and can be modified by middleware.
    */
-  readonly meta: Record<string, unknown>;
+  meta: Record<string, unknown>;
 
   /**
-   * Stop further propagation of this event.
+   * Block further propagation.
    *
-   * Once called:
-   * - remaining middleware is skipped
-   * - remaining listeners are not executed
+   * When called, remaining middleware and/or pattern listeners will not run.
    */
   block(): void;
 };
 
 /**
- * Middleware executed for **every emit call**.
+ * Middleware function signature.
  *
- * Middleware can:
- * - inspect event/payload/matches
- * - read/write `ctx.meta`
- * - block propagation via `ctx.block()`
- * - perform async work
+ * Middleware runs before dispatch and composes like Koa:
+ * each middleware should `await next()` to continue the chain.
  *
- * Chain semantics:
- * - Middlewares are executed sequentially in registration order.
- * - `next()` must be called exactly once to continue the chain (depending on implementation).
+ * @param ctx - Emit context for the current emit.
+ * @param next - Invoke the next middleware in the chain.
  */
-export type Middleware<E extends EventMap> = <K extends keyof E>(
-  ctx: EmitContext<E, K>,
-  next: () => Promise<void>,
-) => Promise<void> | void;
-
-/**
- * Middleware executed **only when pattern listeners are involved**.
- *
- * Typical uses:
- * - logging pattern matches & params
- * - permission checks / gating
- * - validating extracted params
- *
- * Chain semantics depend on the EventBus implementation.
- * In your EventBus, pattern middleware acts as a guard:
- * - if it does not call `next()`, dispatch stops
- * - `next()` must not be called more than once
- */
-export type PatternMiddleware<E extends EventMap> = (
+export type Middleware<E extends EventMap> = (
   ctx: EmitContext<E, keyof E>,
   next: () => Promise<void>,
-) => Promise<void> | void;
+) => void | Promise<void>;
 
 /**
- * Public information of a matched pattern listener.
- *
- * Exposed to middleware and user-land code through `ctx.matched`.
+ * Internal middleware entry with an optional match predicate.
  */
-export interface PatternListenerInfo<E extends EventMap> {
+export type MiddlewareEntry<E extends EventMap> = {
+  /** Middleware implementation. */
+  fn: Middleware<E>;
+
   /**
-   * Original pattern string.
+   * Optional predicate to decide whether this middleware should run.
    *
-   * @example
-   * ```ts
-   * 'user:{id}'
-   * 'order:*'
-   * '**'
-   * ```
+   * If provided and returns false, the middleware is skipped.
    */
-  readonly pattern: string;
-
-  /**
-   * Matching strategy classification.
-   */
-  readonly kind: PatternKind;
-
-  /**
-   * Listener priority. Higher values run earlier.
-   */
-  readonly priority: number;
-
-  /**
-   * Whether this listener was registered with `once`.
-   */
-  readonly once?: boolean;
-
-  /**
-   * Extracted params from the event name.
-   *
-   * Example (separator `:`):
-   * - pattern: `user:{id}`
-   * - event:   `user:42`
-   * - params:  `{ id: '42' }`
-   */
-  readonly params: Readonly<Record<string, string>>;
-
-  /**
-   * The actual handler function.
-   *
-   * Note:
-   * - Kept here mainly for introspection/debugging.
-   * - Middleware should generally not call handlers directly.
-   */
-  readonly handler: (event: keyof E, payload: E[keyof E], params?: Record<string, string>) => void;
-}
-
-/**
- * Internal compiled representation of a pattern listener.
- *
- * Not exposed publicly.
- * Contains precompiled matching logic for performance.
- */
-export interface CompiledPatternListener<E extends EventMap> {
-  /**
-   * Original pattern string (uncompiled).
-   */
-  pattern: string;
-
-  /**
-   * Matching strategy classification.
-   */
-  kind: PatternKind;
-
-  /**
-   * Listener priority. Higher values run earlier.
-   */
-  priority: number;
-
-  /**
-   * Whether the listener should auto-remove after first run.
-   */
-  once?: boolean;
-
-  /**
-   * Match function produced by the compiler.
-   *
-   * @param event - Emitted event name
-   * @returns
-   * - `null` if no match
-   * - params record if matched (possibly empty)
-   */
-  match(event: string): null | Record<string, string>;
-
-  /**
-   * Listener handler.
-   *
-   * @param event  - Emitted event name
-   * @param payload - Payload associated with event
-   * @param params - Extracted params from pattern (if any)
-   */
-  handler(event: keyof E, payload: E[keyof E], params?: Record<string, string>): void;
-}
-
-/**
- * Options for registering a pattern listener.
- */
-export type PatternOptions = {
-  /**
-   * Invoke the listener only once.
-   *
-   * After the first successful match, it is automatically removed.
-   */
-  once?: boolean;
-
-  /**
-   * Listener priority.
-   *
-   * Higher values run earlier.
-   * If omitted, EventBus will derive a priority from pattern specificity.
-   */
-  priority?: number;
-
-  /**
-   * Segment separator used when splitting patterns and events.
-   *
-   * IMPORTANT:
-   * - This default should match your EventBus implementation.
-   * - In the current EventBus code you posted, the default is `':'`.
-   */
-  separator?: string;
+  match?: (ctx: EmitContext<E, keyof E>) => boolean;
 };
 
 /**
- * Internal compiled segment representation produced by the pattern compiler.
- *
- * - `exact`        → exact segment match
- * - `wildcard`     → `*` matches exactly one segment
- * - `deepWildcard` → `**` matches 0..n segments (backtracking)
- * - `param`        → `{key}` captures a segment into params
- * - `regex`        → per-segment regex (used for `?` patterns)
+ * Options for registering middleware via `bus.use(...)`.
  */
-export type CompiledSeg =
-  | { type: 'exact'; value: string }
-  | { type: 'wildcard' }
-  | { type: 'deepWildcard' }
-  | { type: 'param'; key: string }
-  | { type: 'regex'; re: RegExp };
+export type UseOptions<E extends EventMap> = {
+  /**
+   * Run this middleware only when the emitted string event matches the given pattern.
+   *
+   * Pattern syntax is the same as pattern listeners (`*`, `**`, `{param}`).
+   */
+  pattern?: string;
+
+  /**
+   * Segment separator used by `pattern`.
+   *
+   * Defaults to `':'`.
+   */
+  separator?: string;
+
+  /**
+   * Run only when at least one registered pattern listener matches the emitted event.
+   *
+   * Useful if a middleware should only apply when pattern dispatch is relevant.
+   */
+  onlyWhenPatternListenerMatched?: boolean;
+
+  /**
+   * Custom matcher predicate for the middleware.
+   *
+   * When provided, it must return true for the middleware to run.
+   */
+  match?: (ctx: EmitContext<E, keyof E>) => boolean;
+};
+
+/**
+ * Options for subscribing listeners via `on(...)` / `once(...)`.
+ */
+export type OnOptions = {
+  /**
+   * When true, the subscription is treated as a pattern listener.
+   *
+   * In that case, the first argument to `on/once` is a pattern string,
+   * and the handler receives `(event, payload, params)`.
+   */
+  pattern?: boolean;
+
+  /**
+   * Segment separator for pattern matching.
+   *
+   * Defaults to `':'`.
+   */
+  separator?: string;
+
+  /**
+   * Explicit priority for a pattern listener.
+   *
+   * Higher values run earlier. If omitted, a default is derived from the pattern.
+   */
+  priority?: number;
+};
+
+/**
+ * Handler signature for pattern subscriptions.
+ *
+ * @param event - The emitted event key.
+ * @param payload - The emitted payload.
+ * @param params - Captured parameters (if pattern uses `{name}` segments).
+ */
+export type PatternHandler<E extends EventMap> = (
+  event: keyof E,
+  payload: E[keyof E],
+  params?: Record<string, string>,
+) => void;
+
+/**
+ * A registered pattern listener with its compiled matching function.
+ */
+export type CompiledPatternListener<E extends EventMap> = {
+  /** Original pattern string. */
+  pattern: string;
+
+  /** Pattern kind derived from the pattern contents. */
+  kind: PatternKind;
+
+  /** Separator used to split the event and pattern into segments. */
+  separator: string;
+
+  /**
+   * Match function. Returns captured params when matched, otherwise null.
+   *
+   * @param event - String event name to match.
+   */
+  match: (event: string) => Record<string, string> | null;
+
+  /**
+   * Priority for dispatch ordering. Higher values dispatch earlier.
+   *
+   * May be explicitly supplied or computed from pattern specificity.
+   */
+  priority: number;
+
+  /** Whether this listener should be removed after the first invocation. */
+  once?: boolean;
+
+  /** Pattern handler callback. */
+  handler: PatternHandler<E>;
+};
+
+/**
+ * Options used when emitting events.
+ */
+export type EmitOptions = {
+  /**
+   * Whether to store this emission as "sticky".
+   *
+   * Sticky behavior:
+   * - For exact listeners: the last payload per exact event key is cached and replayed
+   *   immediately to new exact subscribers.
+   * - For pattern listeners: string events are appended into a bounded history buffer,
+   *   and new pattern subscribers replay matching history entries.
+   */
+  sticky?: boolean;
+};
