@@ -142,7 +142,11 @@
       "augmentsExtendsReplacesDocs": false,
       "implementsReplacesDocs": false,
       "exemptDestructuredRootsFromChecks": false,
-      "tagNamePreference": {}
+      "tagNamePreference": {
+        "typeParam": "typeParam",
+        "remarks": "remarks",
+        "defaultValue": "defaultValue"
+      }
     },
     "vitest": {
       "typecheck": false
