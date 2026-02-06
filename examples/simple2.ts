@@ -12,13 +12,9 @@ bus.on('user.created', async (payload) => {
   console.log(payload);
 });
 
-bus.on(
-  '**',
-  async (payload) => {
-    console.log('any user event', payload);
-  },
-  { pattern: true },
-);
+bus.on('**', async (_event, payload) => {
+  console.log('any user event', payload);
+});
 
 bus.use(async (ctx, next) => {
   const start = Date.now();

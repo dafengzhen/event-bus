@@ -9,7 +9,6 @@ import type {
   MiddlewareEntry,
   OnOptions,
   PatternHandler,
-  PatternKind,
   PatternListenerInfo,
   TrieNode,
   UseOptions,
@@ -18,74 +17,92 @@ import type {
 import { DispatcherRuntime } from './dispatcher-runtime.ts';
 import { EventScope } from './event-scope.ts';
 
+/**
+ * Monotonic id generator for trie nodes.
+ *
+ * Used to assign each {@link TrieNode} a unique numeric identifier so we can build
+ * collision-resistant “visited” keys during DFS matching without storing object references.
+ *
+ * @internal
+ */
 let TRIE_NODE_ID = 0;
 
 /**
- * A typed EventBus with:
- * - Exact event listeners (`on/once` with an event key)
- * - Pattern listeners for string events (`on/once` with `{ pattern: true }`)
- * - Middleware pipeline (`use`) that can block dispatching
- * - Sticky events (replay last payload per exact event, and a bounded history for pattern matches)
- * - Scoped subscriptions via `EventScope` / `DispatcherRuntime`
+ * Multiplier used to pack two integers into one "visited key" for DFS/backtracking.
  *
- * Pattern syntax (when `options.pattern === true`):
- * - `a:b:c` segments (separator defaults to `:`; configurable via `separator`)
- * - `*` matches exactly one segment
- * - `**` matches zero or more segments (deep wildcard)
- * - `{name}` captures one segment into `params.name`
+ * We frequently need to remember whether a state `(nodeId, segmentIndex)` (or `(patternIndex, eventIndex)`)
+ * has already been expanded, to avoid infinite loops—especially with deep wildcards (`**`).
  *
- * Priority:
- * - More specific patterns get higher priority (exact segments score higher).
- * - For equal priority, earlier registration order runs first.
+ * The key is computed as:
+ * - `key = a * VISITED_KEY_MULT + b`
  *
- * @typeParam E - Event map where keys are event names and values are payload types.
+ * Requirements:
+ * - `VISITED_KEY_MULT` must be larger than the maximum expected value of `b` (the second coordinate),
+ *   so that `(a1, b1)` and `(a2, b2)` do not collide.
+ *
+ * @internal
+ */
+const VISITED_KEY_MULT = 1_000_000;
+
+/**
+ * A lightweight, strongly-typed event bus with:
+ * - Exact event listeners (`on`, `once`, `off`)
+ * - Pattern listeners with params/globs/wildcards (e.g. `user:{id}:**`, `order:*`, `foo[ab]`)
+ * - Middleware pipeline (`use`) with optional matching filters
+ * - Scoped listener lifetimes via {@link EventScope}
+ * - “Sticky” events that are replayed to future listeners (bounded by `stickyMax`)
+ *
+ * Pattern syntax (per segment, split by `separator`, default `:`):
+ * - `**` deep wildcard: matches zero or more segments
+ * - `*`  segment wildcard: matches exactly one segment
+ * - `{name}` param: captures a segment into `params.name`
+ * - glob segment: supports `*`, `?`, and character classes like `[abc]` / `[!abc]`
+ *
+ * Notes:
+ * - Pattern listeners are stored in a trie for efficient matching.
+ * - When emitting, middlewares run first; they can call `ctx.block()` to stop dispatch.
+ * - Listener exceptions are caught and rethrown asynchronously to avoid breaking dispatch.
  *
  * @author dafengzhen
  */
 export class EventBus<E extends EventMap> {
-  /** Runtime used to obtain and run with scopes. */
+  /** Runtime that provides scope tracking and `runWithScope` execution context. */
   readonly runtime: DispatcherRuntime<E>;
 
-  /** Whether this instance has been destroyed. */
   private destroyed = false;
 
   /** Exact listeners keyed by event name. */
   private listenersByEvent = new Map<keyof E, Set<Listener<any>>>();
 
-  /** Middleware pipeline, applied in registration order (snapshot per emit). */
+  /** Registered middlewares in insertion order. */
   private middlewares: MiddlewareEntry<E>[] = [];
 
   /** Cache for compiled patterns, keyed by `${pattern}|${separator}`. */
   private patternCache = new Map<string, ReturnType<EventBus<E>['compilePattern']>>();
 
-  /** Pattern tries keyed by separator string. */
+  /** A trie per separator (e.g. `:` or `/`) for pattern listeners. */
   private patternTries = new Map<string, TrieNode<E>>();
 
-  /** Monotonic counter used for stable ordering among pattern listeners. */
+  /** Monotonic sequence used to stable-sort pattern listeners. */
   private seq = 0;
 
   /**
-   * Sticky history for string events to support immediate replay for pattern listeners.
-   * Bounded by `stickyMax`.
+   * Sticky events for string events, used to “replay” to newly-added pattern listeners.
+   * This list is bounded by {@link stickyMax}.
    */
   private stickyEvents: Array<{ event: string; payload: unknown }> = [];
 
-  /**
-   * Sticky payloads for exact events:
-   * - When emitting with `{ sticky: true }`, the last payload is stored here.
-   * - When adding an exact listener, it is invoked immediately if a sticky payload exists.
-   */
+  /** Sticky payloads for exact (typed) events. */
   private stickyExact = new Map<keyof E, unknown>();
 
-  /** Maximum number of sticky history entries for pattern replay. */
+  /** Maximum number of sticky string events retained for pattern replay. */
   private readonly stickyMax: number;
 
   /**
-   * Create a new EventBus.
+   * Create an EventBus.
    *
-   * @param options - Construction options.
-   * @param options.runtime - Custom dispatcher runtime (defaults to a new `DispatcherRuntime`).
-   * @param options.stickyMax - Max history size for sticky string events used by pattern listeners (default `200`).
+   * @param options.runtime - Optional custom runtime. Defaults to a new {@link DispatcherRuntime}.
+   * @param options.stickyMax - Maximum number of sticky string events retained for pattern replay. Default: `200`.
    */
   constructor(options?: { runtime?: DispatcherRuntime<E>; stickyMax?: number }) {
     this.runtime = options?.runtime ?? new DispatcherRuntime<E>();
@@ -93,7 +110,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Remove all listeners (exact + pattern) but keep middleware and sticky state.
+   * Remove all listeners and pattern tries (exact and pattern listeners).
+   * Middlewares and sticky storage are not affected (use {@link reset} to clear everything).
    */
   clearListeners(): void {
     this.listenersByEvent.clear();
@@ -101,13 +119,10 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Create a new `EventScope`.
+   * Create a new {@link EventScope} for managing listener lifetimes.
+   * Listeners registered while a scope is active can be automatically disposed by destroying the scope.
    *
-   * A scope can register multiple `off()` functions and dispose them together.
-   *
-   * @param parent - Optional parent scope (defaults to current runtime scope when used via `withScope`).
-   * @returns A new scope.
-   * @throws If the EventBus has been destroyed.
+   * @param parent - Optional parent scope. If omitted, uses the runtime’s current scope.
    */
   createScope(parent?: EventScope<E>): EventScope<E> {
     this.assertNotDestroyed();
@@ -116,8 +131,8 @@ export class EventBus<E extends EventMap> {
 
   /**
    * Destroy this EventBus instance.
-   *
-   * After destruction, all public APIs throw if called.
+   * After calling this, all APIs will throw if used again.
+   * This also clears listeners, middlewares, sticky state, and pattern cache.
    */
   destroy(): void {
     if (this.destroyed) {
@@ -129,27 +144,18 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Emit an event (fire-and-forget).
+   * Emit an event synchronously (fire-and-forget).
    *
-   * This method schedules errors to be rethrown asynchronously.
-   * If you need a rejected promise instead, use `emitAsync`.
+   * Middlewares run asynchronously; errors are rethrown on a microtask.
    *
-   * Payload vs options overload:
-   * - `emit(event, payload, options)`
-   * - `emit(event, options)` where `options` looks like `EmitOptions`
-   *
-   * Sticky:
-   * - When `options.sticky === true`, stores the payload:
-   *   - for exact listeners: last payload by event key
-   *   - for pattern listeners (string events): also stored in bounded history for replay
-   *
-   * @typeParam K - Exact event key.
-   * @param event - Exact event name.
-   * @param payload - Payload for the event.
-   * @param options - Emit options.
-   * @throws If the EventBus has been destroyed.
+   * @param event - Event key.
+   * @param payload - Event payload.
+   * @param options - Emit options (e.g. sticky, metaPatch).
    */
   emit<K extends keyof E>(event: K, payload?: E[K], options?: EmitOptions): void;
+  /**
+   * Emit an event with `(event, options)` signature (no payload).
+   */
   emit<K extends keyof E>(event: K, payloadOrOptions?: E[K] | EmitOptions, options?: EmitOptions) {
     this.assertNotDestroyed();
     const [payload, opts] = this.parseEmitArgs<E[K]>(payloadOrOptions, options);
@@ -157,24 +163,20 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Emit an event and await completion of middleware + dispatch.
+   * Emit an event and await the full middleware + dispatch pipeline.
    *
-   * Payload vs options overload:
-   * - `emitAsync(event, payload, options)`
-   * - `emitAsync(event, options)` where `options` looks like `EmitOptions`
-   *
-   * @typeParam K - Exact event key.
-   * @param event - Exact event name.
-   * @param payload - Payload for the event.
+   * @param event - Event key.
+   * @param payload - Event payload.
    * @param options - Emit options.
-   * @returns A promise that resolves when dispatch completes.
-   * @throws If the EventBus has been destroyed.
    */
   async emitAsync<K extends keyof E>(
     event: K,
     payload?: E[K],
     options?: EmitOptions,
   ): Promise<void>;
+  /**
+   * Emit an event with `(event, options)` signature (no payload) and await completion.
+   */
   async emitAsync<K extends keyof E>(
     event: K,
     payloadOrOptions?: E[K] | EmitOptions,
@@ -186,12 +188,10 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Unregister an exact event listener.
+   * Remove an exact listener from an event.
    *
-   * @typeParam K - Exact event key.
-   * @param event - Exact event name.
-   * @param listener - Listener to remove.
-   * @throws If the EventBus has been destroyed.
+   * @param event - Event key.
+   * @param listener - Listener function to remove.
    */
   off<K extends keyof E>(event: K, listener: Listener<E[K]>): void {
     this.assertNotDestroyed();
@@ -207,80 +207,59 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Register an exact event listener.
+   * Register an exact listener.
    *
-   * If the event has a sticky payload, the listener is invoked immediately (synchronously, guarded).
+   * If the event has been emitted as sticky before, the listener is invoked immediately (safely).
    *
-   * @typeParam K - Exact event key.
-   * @param event - Exact event name.
-   * @param listener - Listener invoked with the event payload.
-   * @param options - Listener options.
-   * @returns An `off()` function to unregister this listener.
-   * @throws If the EventBus has been destroyed.
+   * @param event - Event key.
+   * @param listener - Listener invoked with `(payload)`.
+   * @param options - Options such as `separator` (used only if treated as pattern), `priority`, etc.
+   * @returns An `off()` function to remove this listener.
    */
   on<K extends keyof E>(event: K, listener: Listener<E[K]>, options?: OnOptions): () => void;
-
   /**
-   * Register a pattern listener (string events only).
+   * Register a pattern listener.
    *
-   * If there are sticky history entries, any matching past events are replayed immediately.
+   * The handler signature is `(event, payload, params)`.
+   * Patterns can include wildcards, params, and globs (see class doc).
+   *
+   * If there are matching sticky string events, the handler is replayed immediately for those matches.
    *
    * @param pattern - Pattern string.
-   * @param handler - Handler invoked with `(event, payload, params)`.
-   * @param options - Options with `pattern: true`.
-   * @returns An `off()` function to unregister this listener.
-   * @throws If the EventBus has been destroyed.
+   * @param handler - Pattern handler.
+   * @param options - Pattern options (`separator`, `priority`, ...).
+   * @returns An `off()` function to remove this listener.
    */
-  on(
-    pattern: string,
-    handler: PatternHandler<E>,
-    options: OnOptions & { pattern: true },
-  ): () => void;
+  on(pattern: string, handler: PatternHandler<E>, options?: OnOptions): () => void;
   on(eventOrPattern: any, handler: any, options?: OnOptions): () => void {
     this.assertNotDestroyed();
     return this.add(false, eventOrPattern, handler, options, this.runtime.getScope());
   }
 
   /**
-   * Register a one-time exact event listener.
+   * Register a one-time listener (exact event or pattern).
+   * The listener is removed after the first invocation.
    *
-   * If the event has a sticky payload, the listener is invoked immediately and then removed.
+   * Sticky behavior:
+   * - Exact event: if already sticky, it will fire immediately and unregister.
+   * - Pattern: if any sticky string event matches, it will fire and then unregister.
    *
-   * @typeParam K - Exact event key.
-   * @param event - Exact event name.
-   * @param listener - Listener invoked with the event payload.
-   * @param options - Listener options.
-   * @returns An `off()` function to unregister this listener.
-   * @throws If the EventBus has been destroyed.
+   * @returns An `off()` function to remove this listener early.
    */
   once<K extends keyof E>(event: K, listener: Listener<E[K]>, options?: OnOptions): () => void;
-
-  /**
-   * Register a one-time pattern listener (string events only).
-   *
-   * If there are sticky history entries, the first matching replay triggers the handler and then removes it.
-   *
-   * @param pattern - Pattern string.
-   * @param handler - Handler invoked with `(event, payload, params)`.
-   * @param options - Options with `pattern: true`.
-   * @returns An `off()` function to unregister this listener.
-   * @throws If the EventBus has been destroyed.
-   */
-  once(
-    pattern: string,
-    handler: PatternHandler<E>,
-    options: OnOptions & { pattern: true },
-  ): () => void;
+  once(pattern: string, handler: PatternHandler<E>, options?: OnOptions): () => void;
   once(eventOrPattern: any, handler: any, options?: OnOptions): () => void {
     this.assertNotDestroyed();
     return this.add(true, eventOrPattern, handler, options, this.runtime.getScope());
   }
 
   /**
-   * Reset the EventBus:
-   * - clears listeners (exact + pattern)
-   * - clears middleware
+   * Reset this EventBus:
+   * - clears exact listeners and pattern listeners
+   * - removes all middlewares
    * - clears sticky state
+   *
+   * Does not destroy the instance or clear the pattern compilation cache (use {@link destroy}).
    */
   reset(): void {
     this.clearListeners();
@@ -292,21 +271,14 @@ export class EventBus<E extends EventMap> {
   /**
    * Register a middleware.
    *
-   * Middlewares are invoked in registration order for each `emit/emitAsync`.
-   * A middleware can:
-   * - observe/modify `ctx.meta`
-   * - call `ctx.block()` to stop dispatching
-   * - decide whether to call `next()` (exactly once) to continue the pipeline
-   *
-   * Matching:
-   * - `options.pattern`: only run when `ctx.event` (string) matches the given pattern
-   * - `options.onlyWhenPatternListenerMatched`: only run when the current emitted string event has at least one pattern listener match
+   * Middleware can optionally be restricted by:
+   * - `options.pattern`: only run when emitted string event matches the pattern
+   * - `options.onlyWhenPatternListenerMatched`: only run when any pattern listener would match the event
    * - `options.match`: custom predicate
    *
-   * @param mw - Middleware function.
-   * @param options - Matching options.
-   * @returns An `off()` function to unregister this middleware.
-   * @throws If the EventBus has been destroyed.
+   * @param mw - Middleware function `(ctx, next) => ...`.
+   * @param options - Matching options controlling when this middleware runs.
+   * @returns An `off()` function to remove this middleware.
    */
   use(mw: Middleware<E>, options?: UseOptions<E>): () => void {
     this.assertNotDestroyed();
@@ -339,17 +311,13 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Run a function within a temporary scope, then destroy that scope afterwards.
+   * Run `fn` inside a fresh scope, then destroy the scope automatically.
    *
-   * Any subscriptions created via `on/once` inside the callback are automatically registered to
-   * the current runtime scope and will be disposed when the scope is destroyed.
+   * Useful for temporary listeners that must be cleaned up even if `fn` throws.
    *
-   * @typeParam T - Return type.
-   * @param fn - Function to run with the created scope.
-   * @param options - Scope options.
-   * @param options.parent - Parent scope (defaults to current runtime scope).
-   * @returns The return value of `fn`.
-   * @throws If the EventBus has been destroyed.
+   * @param fn - Function executed with the created scope.
+   * @param options options
+   * @param options.parent - Optional parent scope (defaults to runtime current scope).
    */
   async withScope<T>(
     fn: (scope: EventScope<E>) => Promise<T> | T,
@@ -369,7 +337,11 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Core emit implementation: builds context, runs middleware, then dispatches.
+   * Internal emit implementation:
+   * - optionally stores sticky payload
+   * - matches pattern listeners (string events only)
+   * - builds {@link EmitContext}
+   * - runs middlewares then dispatch
    */
   private async _emit<K extends keyof E>(event: K, payload: E[K], options?: EmitOptions) {
     let blocked = false;
@@ -385,18 +357,23 @@ export class EventBus<E extends EventMap> {
       typeof event === 'string' ? this.matchPatternListeners(event) : ([] as const);
 
     const ctx: EmitContext<E, K> = {
+      /** Stop the remaining middleware/dispatch pipeline. */
       block() {
         blocked = true;
       },
+      /** Whether the pipeline has been blocked. */
       get blocked() {
         return blocked;
       },
       event,
+      /**
+       * Frozen list of matched pattern listeners (sorted by priority/sequence),
+       * including captured `params` for each match.
+       */
       matched: Object.freeze(
         matchedRaw.map(
           ({ entry, params }): PatternListenerInfo<E> => ({
             handler: entry.handler,
-            kind: entry.kind,
             once: entry.once,
             params: Object.freeze({ ...params }),
             pattern: entry.pattern,
@@ -404,6 +381,7 @@ export class EventBus<E extends EventMap> {
           }),
         ),
       ),
+      /** Metadata bag; starts from `options.metaPatch` shallow-cloned. */
       meta: { ...options?.metaPatch },
       payload,
     };
@@ -412,18 +390,26 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Register either an exact listener or a pattern listener depending on options.
+   * Add either an exact listener or a pattern listener, depending on inputs.
    *
-   * If a scope is provided, the resulting `off()` is registered into it.
+   * A string `eventOrPattern` is treated as a pattern if:
+   * - handler arity suggests pattern handler (`handler.length >= 2`), OR
+   * - the string “looks like” a pattern (contains wildcard/param/glob syntax)
    */
   private add(
     once: boolean,
-    eventOrPattern: keyof E | string,
+    eventOrPattern: any | keyof E | string,
     handler: any,
     options?: OnOptions,
     scope?: EventScope<E>,
   ): () => void {
-    if (options?.pattern) {
+    const sep = options?.separator ?? ':';
+
+    const treatAsPattern =
+      typeof eventOrPattern === 'string' &&
+      (handler?.length >= 2 || this.looksLikePattern(eventOrPattern, sep));
+
+    if (treatAsPattern) {
       const off = this.addPatternListener(once, String(eventOrPattern), handler, options);
       if (scope) {
         scope.registerOff(off);
@@ -471,27 +457,19 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Add a compiled pattern listener into the trie.
-   *
-   * This also replays matching sticky history entries immediately.
-   *
-   * @param once - Whether the handler should auto-remove after the first match.
-   * @param pattern - Pattern string.
-   * @param handler - Handler function.
-   * @param options - Listener options (must include `pattern: true` at call site).
-   * @returns An `off()` function.
+   * Register a pattern listener and insert it into the separator-specific trie.
+   * Also replays matching sticky string events immediately.
    */
-  private addPatternListener(once: boolean, pattern: string, handler: any, options: OnOptions) {
-    const sep = options.separator ?? ':';
+  private addPatternListener(once: boolean, pattern: string, handler: any, options?: OnOptions) {
+    const sep = options?.separator ?? ':';
     const compiled = this.compilePatternCached(pattern, sep);
 
     const entry: CompiledPatternListener<E> = {
       handler,
-      kind: compiled.kind,
       match: compiled.match,
       once,
       pattern,
-      priority: options.priority ?? compiled.priority,
+      priority: options?.priority ?? compiled.priority,
       separator: sep,
       seq: ++this.seq,
     };
@@ -509,12 +487,10 @@ export class EventBus<E extends EventMap> {
       }
     }
 
-    return this.makeOff(() => {
-      this.trieRemove(entry, compiled.compiledSegs);
-    });
+    return this.makeOff(() => this.trieRemove(entry, compiled.compiledSegs));
   }
 
-  /** @internal Throw if this EventBus has been destroyed. */
+  /** Throw if this instance has been destroyed. */
   private assertNotDestroyed() {
     if (this.destroyed) {
       throw new Error('EventBus instance has been destroyed.');
@@ -522,22 +498,18 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Compile a pattern into segments + a match function.
+   * Compile a pattern into:
+   * - `compiledSegs`: normalized segments for trie insertion and matching
+   * - `match(event)`: returns params if matched, otherwise `null`
+   * - `priority`: a score where higher means “more specific” (sorted first)
    *
-   * Special case:
-   * - Pattern `"**"` matches any string event and returns empty params.
-   *
-   * The returned `priority` is higher for more specific patterns (more exact segments).
-   *
-   * @param pattern - Pattern string (supports `*`, `**`, `{param}`).
-   * @param sep - Segment separator (e.g. `:`).
-   * @returns Compiled pattern info.
+   * @param pattern - Pattern string.
+   * @param sep - Segment separator (e.g. `:`). If empty, the whole string is one segment.
    */
   private compilePattern(pattern: string, sep: string) {
     if (pattern === '**') {
       return {
         compiledSegs: [{ type: 'deepWildcard' as const }] as CompiledSeg[],
-        kind: 'wildcard' as const,
         match: () => ({}) as Record<string, string>,
         priority: -100,
       };
@@ -545,85 +517,111 @@ export class EventBus<E extends EventMap> {
 
     const pSegs = sep ? pattern.split(sep) : [pattern];
     let score = 0;
-    let hasStar = false;
-    let hasParam = false;
 
     const compiledSegs: CompiledSeg[] = pSegs.map((seg) => {
       if (seg === '**') {
-        hasStar = true;
+        score += 0;
         return { type: 'deepWildcard' as const };
       }
       if (seg === '*') {
-        hasStar = true;
-        return { type: 'wildcard' as const };
+        score += 10;
+        return { type: 'segWildcard' as const };
       }
-      if (seg.startsWith('{') && seg.endsWith('}')) {
-        hasParam = true;
+      if (seg.startsWith('{') && seg.endsWith('}') && seg.length > 2) {
+        score += 80;
         return { key: seg.slice(1, -1), type: 'param' as const };
+      }
+      if (seg.includes('*') || seg.includes('?') || seg.includes('[')) {
+        score += 70;
+        return { re: this.globToRegExp(seg), src: seg, type: 'glob' as const };
       }
 
       score += 100;
       return { type: 'exact' as const, value: seg };
     });
 
-    const kind: PatternKind = hasStar ? 'wildcard' : hasParam ? 'param' : 'exact';
-
+    /**
+     * Match an emitted string event against this compiled pattern.
+     *
+     * Implementation uses an explicit stack (DFS) to support `**` backtracking
+     * without recursion. Returns a params object on success, otherwise `null`.
+     */
     const match = (event: string) => {
       const eSegs = sep ? event.split(sep) : [event];
-      const params: Record<string, string> = {};
 
-      let i = 0;
-      let j = 0;
-      let starI = -1;
-      let starJ = -1;
+      type State = { i: number; j: number; params: Record<string, string> };
+      const stack: State[] = [{ i: 0, j: 0, params: {} }];
 
-      while (j < eSegs.length) {
-        const p = compiledSegs[i];
+      const expanded = new Set<number>();
+      const keyOf = (i: number, j: number) => i * VISITED_KEY_MULT + j;
 
-        if (p) {
-          if (p.type === 'deepWildcard') {
-            starI = i++;
-            starJ = j;
-            continue;
-          }
-          if (p.type === 'wildcard') {
+      while (stack.length) {
+        const st = stack.pop()!;
+        let i = st.i;
+        const j = st.j;
+        const curParams = st.params;
+
+        if (j === eSegs.length) {
+          while (compiledSegs[i]?.type === 'deepWildcard') {
             i++;
-            j++;
-            continue;
           }
-          if (p.type === 'exact') {
-            if (p.value === eSegs[j]) {
-              i++;
-              j++;
-              continue;
-            }
-          } else if (p.type === 'param') {
-            params[p.key] = eSegs[j];
-            i++;
-            j++;
-            continue;
+          if (i === compiledSegs.length) {
+            return curParams;
           }
-        }
-
-        if (starI !== -1) {
-          i = starI + 1;
-          j = ++starJ;
           continue;
         }
 
-        return null;
+        const p = compiledSegs[i];
+        const seg = eSegs[j];
+        if (!p) {
+          continue;
+        }
+
+        if (p.type === 'deepWildcard') {
+          const k0 = keyOf(i + 1, j);
+          if (!expanded.has(k0)) {
+            expanded.add(k0);
+            stack.push({ i: i + 1, j, params: curParams });
+          }
+          stack.push({ i, j: j + 1, params: curParams });
+          continue;
+        }
+
+        if (p.type === 'segWildcard') {
+          stack.push({ i: i + 1, j: j + 1, params: curParams });
+          continue;
+        }
+
+        if (p.type === 'exact') {
+          if (p.value === seg) {
+            stack.push({ i: i + 1, j: j + 1, params: curParams });
+          }
+          continue;
+        }
+
+        if (p.type === 'glob') {
+          if (p.re.test(seg)) {
+            stack.push({ i: i + 1, j: j + 1, params: curParams });
+          }
+          continue;
+        }
+
+        // param
+        stack.push({ i: i + 1, j: j + 1, params: { ...curParams, [p.key]: seg } });
       }
 
-      while (compiledSegs[i]?.type === 'deepWildcard') {
-        i++;
-      }
-      return i === compiledSegs.length ? params : null;
+      return null;
     };
 
-    return { compiledSegs, kind, match, priority: score };
+    return { compiledSegs, match, priority: score };
   }
 
-  /** @internal Compile and cache patterns per `(pattern, separator)` pair. */
+  /**
+   * Compile a pattern and cache the result by `(pattern, separator)`.
+   *
+   * @param pattern - Pattern string.
+   * @param sep - Segment separator.
+   */
   private compilePatternCached(pattern: string, sep: string) {
     const cacheKey = `${pattern}|${sep}`;
     let compiled = this.patternCache.get(cacheKey);
@@ -634,16 +632,14 @@ export class EventBus<E extends EventMap> {
     return compiled;
   }
 
-  /** @internal Create a new trie node. */
+  /** Create a new trie node with a unique id. */
   private createNode<T extends EventMap>(): TrieNode<T> {
-    return {
-      end: [],
-      exact: new Map(),
-      id: ++TRIE_NODE_ID,
-    };
+    return { end: [], exact: new Map(), id: ++TRIE_NODE_ID };
   }
 
-  /** @internal Get (or create) the listener set for an exact event key. */
+  /**
+   * Get or create the Set that stores exact listeners for `event`.
+   */
   private getListenerSet<K extends keyof E>(event: K): Set<Listener<E[K]>> {
     let set = this.listenersByEvent.get(event) as Set<Listener<E[K]>> | undefined;
     if (!set) {
@@ -653,7 +649,65 @@ export class EventBus<E extends EventMap> {
     return set;
   }
 
-  /** @internal Check whether any pattern listener matches the given string event. */
+  /**
+   * Convert a glob segment into a RegExp.
+   * Supported:
+   * - `*` any substring
+   * - `?` any single char
+   * - `[abc]` character class
+   * - `[!abc]` negated class
+   */
+  private globToRegExp(seg: string): RegExp {
+    let re = '^';
+    for (let i = 0; i < seg.length; i++) {
+      const ch = seg[i];
+
+      if (ch === '*') {
+        re += '.*';
+        continue;
+      }
+      if (ch === '?') {
+        re += '.';
+        continue;
+      }
+      if (ch === '[') {
+        const j = seg.indexOf(']', i + 1);
+        if (j === -1) {
+          re += '\\[';
+          continue;
+        }
+
+        const content = seg.slice(i + 1, j);
+        if (content.length === 0) {
+          re += '\\[\\]';
+          i = j;
+          continue;
+        }
+
+        let cls = content;
+        if (cls[0] === '!') {
+          cls = '^' + cls.slice(1);
+        }
+        cls = cls.replace(/\\/g, '\\\\').replace(/]/g, '\\]');
+        re += `[${cls}]`;
+        i = j;
+        continue;
+      }
+
+      if (/[$()*+.?[\\\]^{|}]/.test(ch)) {
+        re += '\\' + ch;
+      } else {
+        re += ch;
+      }
+    }
+    re += '$';
+    return new RegExp(re);
+  }
+
+  /**
+   * Check whether any registered pattern listener (for any separator)
+   * would match the given string event.
+   */
   private hasAnyPatternMatch(event: string): boolean {
     for (const [sep, root] of this.patternTries) {
       const eSegs = sep ? event.split(sep) : [event];
@@ -665,7 +719,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Dispatch to exact listeners first, then matched pattern listeners in priority order.
+   * Invoke exact listeners first, then matched pattern listeners (in sorted order).
+   * Pattern listeners marked `once` are removed after invocation.
    */
   private async invokeDispatch(
     ctx: EmitContext<E, keyof E>,
@@ -688,9 +743,7 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Invoke exact listeners for the given event.
-   *
-   * Listeners are invoked on a snapshot to avoid issues if listeners mutate the set during dispatch.
+   * Invoke all exact listeners registered for `event`.
    */
   private invokeExactListeners<K extends keyof E>(event: K, payload: E[K]) {
     const set = this.listenersByEvent.get(event);
@@ -698,22 +751,40 @@ export class EventBus<E extends EventMap> {
       return;
     }
 
-    const snapshot = Array.from(set);
-    for (const fn of snapshot) {
+    for (const fn of Array.from(set)) {
       this.safeCall(() => fn(payload));
     }
   }
 
-  /** @internal Heuristic to detect `EmitOptions` in overloaded `emit` calls. */
+  /**
+   * Heuristic for distinguishing payload vs options in `emit(...)`.
+   * Treats objects containing `sticky` or `metaPatch` as {@link EmitOptions}.
+   */
   private looksLikeEmitOptions(x: any): x is EmitOptions {
     return !!x && typeof x === 'object' && ('sticky' in x || 'metaPatch' in x);
   }
 
   /**
-   * Wraps a cleanup function so it can only be executed once.
-   *
-   * @param fn - Cleanup function to run once.
-   * @returns A function that runs `fn` at most once.
+   * Heuristic for determining whether a string “looks like” a pattern.
+   */
+  private looksLikePattern(s: string, sep: string): boolean {
+    const segs = sep ? s.split(sep) : [s];
+    for (const seg of segs) {
+      if (seg === '*' || seg === '**') {
+        return true;
+      }
+      if (seg.startsWith('{') && seg.endsWith('}') && seg.length > 2) {
+        return true;
+      }
+      if (this.segmentHasGlobMeta(seg)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Wrap a cleanup function as an idempotent `off()` callback.
    */
   private makeOff(fn: () => void): () => void {
     let done = false;
@@ -727,19 +798,36 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Collect all matching pattern listeners for a string event across all separators.
-   *
-   * Results are sorted by:
-   * - descending priority
-   * - ascending registration sequence
+   * Match all pattern listeners against a string event, deduplicate by `(seq, paramsKey)`,
+   * then sort:
+   * - higher priority first
+   * - for equal priority, earlier registered first (lower seq)
    */
   private matchPatternListeners(event: string) {
-    const out: Array<{ entry: CompiledPatternListener<E>; params: Record<string, string> }> = [];
+    const raw: Array<{
+      entry: CompiledPatternListener<E>;
+      params: Record<string, string>;
+      paramsKey: string;
+    }> = [];
 
     for (const [sep, root] of this.patternTries) {
       const eSegs = sep ? event.split(sep) : [event];
-      this.trieMatchCollect(root, eSegs, out);
+      this.trieMatchCollect(root, eSegs, raw);
     }
+
+    const uniq = new Map<
+      string,
+      { entry: CompiledPatternListener<E>; params: Record<string, string> }
+    >();
+
+    for (const m of raw) {
+      const key = `${m.entry.seq}|${m.paramsKey}`;
+      if (!uniq.has(key)) {
+        uniq.set(key, { entry: m.entry, params: m.params });
+      }
+    }
+
+    const out = Array.from(uniq.values());
 
     out.sort((a, b) => {
       if (b.entry.priority !== a.entry.priority) {
@@ -751,7 +839,11 @@ export class EventBus<E extends EventMap> {
     return out;
   }
 
-  /** @internal Parse overloaded `emit` arguments into `[payload, options]`. */
+  /**
+   * Parse overloaded `emit` arguments:
+   * - `(event, payload?, options?)`
+   * - `(event, options)` (when second arg looks like EmitOptions)
+   */
   private parseEmitArgs<P>(
     payloadOrOptions?: EmitOptions | P,
     options?: EmitOptions,
@@ -762,7 +854,7 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Push a sticky string event into bounded history.
+   * Append a sticky string event for pattern replay, enforcing {@link stickyMax}.
    */
   private pushStickyEvent(event: string, payload: unknown) {
     this.stickyEvents.push({ event, payload });
@@ -772,7 +864,7 @@ export class EventBus<E extends EventMap> {
     }
   }
 
-  /** @internal Remove the first occurrence of `item` from `arr` if present. */
+  /** Remove the first occurrence of `item` from `arr` if present. */
   private removeFromArray<T>(arr: T[], item: T) {
     const i = arr.indexOf(item);
     if (i >= 0) {
@@ -780,7 +872,9 @@ export class EventBus<E extends EventMap> {
     }
   }
 
-  /** @internal Rethrow an error on a microtask so it is not swallowed by async chains. */
+  /**
+   * Rethrow an error asynchronously (microtask), so synchronous flows keep going.
+   */
   private rethrowAsync(err: unknown) {
     queueMicrotask(() => {
       throw err;
@@ -788,15 +882,16 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Run middleware pipeline, then dispatch to exact listeners and matched pattern listeners.
+   * Run middlewares in order and finally dispatch listeners.
    *
-   * `next()` must be called at most once per middleware.
+   * Middleware must call `next()` exactly once to continue.
+   * If `ctx.block()` is called, the pipeline stops immediately.
    */
   private async runMiddlewares<K extends keyof E>(
     ctx: EmitContext<E, K>,
     rawMatches: Array<{ entry: CompiledPatternListener<E>; params: Record<string, string> }>,
   ): Promise<void> {
-    const mws = this.middlewares.slice(); // snapshot
+    const mws = this.middlewares.slice();
     let i = 0;
 
     const next = async (): Promise<void> => {
@@ -828,9 +923,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Safely invoke a user callback and rethrow errors asynchronously.
-   *
-   * This prevents one listener from breaking the whole dispatch loop while still surfacing errors.
+   * Safely invoke a listener/handler.
+   * Errors are logged and rethrown asynchronously.
    */
   private safeCall(fn: () => void) {
     try {
@@ -842,17 +936,23 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Fast existence check: return true if any match exists in the trie.
-   *
-   * Uses the same deep-wildcard expansion guard as `trieMatchCollect`.
+   * Whether a segment contains glob meta characters.
+   * This is used only as a heuristic for pattern detection.
+   */
+  private segmentHasGlobMeta(seg: string): boolean {
+    return seg.includes('*') || seg.includes('?') || seg.includes('[') || seg.includes(']');
+  }
+
+  /**
+   * Fast existence check: returns `true` if any pattern listener can match `eSegs`.
+   * Used by middleware `onlyWhenPatternListenerMatched`.
    */
   private trieHasAnyMatch(root: TrieNode<E>, eSegs: string[]): boolean {
     type State = { i: number; node: TrieNode<E> };
-
     const stack: State[] = [{ i: 0, node: root }];
 
     const expanded = new Set<number>();
-    const keyOf = (nodeId: number, i: number) => nodeId * 1_000_000 + i;
+    const keyOf = (nodeId: number, i: number) => nodeId * VISITED_KEY_MULT + i;
 
     while (stack.length) {
       const st = stack.pop()!;
@@ -894,6 +994,14 @@ export class EventBus<E extends EventMap> {
         stack.push({ i: i + 1, node: node.star });
       }
 
+      if (node.globs?.length) {
+        for (const g of node.globs) {
+          if (g.re.test(seg)) {
+            stack.push({ i: i + 1, node: g.node });
+          }
+        }
+      }
+
       if (node.params?.length) {
         for (const p of node.params) {
           stack.push({ i: i + 1, node: p.node });
@@ -905,11 +1013,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Insert a compiled pattern listener into the trie.
-   *
-   * This maintains `node.end` sorted by:
-   * - descending priority
-   * - ascending registration sequence
+   * Insert a compiled pattern listener into the separator-specific trie.
+   * Leaf `end` arrays are kept ordered by `(priority desc, seq asc)` to speed up collection.
    */
   private trieInsert(entry: CompiledPatternListener<E>, segs: CompiledSeg[]) {
     const sep = entry.separator;
@@ -931,15 +1036,30 @@ export class EventBus<E extends EventMap> {
         continue;
       }
 
-      if (s.type === 'wildcard') {
+      if (s.type === 'segWildcard') {
         node.star ??= this.createNode<E>();
         node = node.star;
         continue;
       }
 
       if (s.type === 'deepWildcard') {
-        node.deep ??= this.createNode<E>();
+        if (!node.deep) {
+          const deepNode = this.createNode<E>();
+          deepNode.deep = deepNode;
+          node.deep = deepNode;
+        }
         node = node.deep;
+        continue;
+      }
+
+      if (s.type === 'glob') {
+        node.globs ??= [];
+        let found = node.globs.find((x) => x.src === s.src);
+        if (!found) {
+          found = { node: this.createNode<E>(), re: s.re, src: s.src };
+          node.globs.push(found);
+        }
+        node = found.node;
         continue;
       }
 
@@ -977,22 +1097,29 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * @internal Collect matches in the trie using an explicit stack (non-recursive).
-   *
-   * Deep wildcard (`**`) can match zero or more segments, so this keeps an `expanded` set to avoid
-   * repeatedly expanding the same `(node, index)` state via the "match zero segments" path.
+   * Collect all pattern listener matches for `eSegs` into `out`.
+   * Also produces a `paramsKey` used for deduplication.
    */
   private trieMatchCollect(
     root: TrieNode<E>,
     eSegs: string[],
-    out: Array<{ entry: CompiledPatternListener<E>; params: Record<string, string> }>,
+    out: Array<{
+      entry: CompiledPatternListener<E>;
+      params: Record<string, string>;
+      paramsKey: string;
+    }>,
   ) {
-    type State = { i: number; node: TrieNode<E>; params: Record<string, string> };
+    type State = {
+      i: number;
+      node: TrieNode<E>;
+      params: Record<string, string>;
+      paramsKey: string;
+    };
 
-    const stack: State[] = [{ i: 0, node: root, params: {} }];
+    const stack: State[] = [{ i: 0, node: root, params: {}, paramsKey: '' }];
 
     const expanded = new Set<number>();
-    const keyOf = (nodeId: number, i: number) => nodeId * 1_000_000 + i;
+    const keyOf = (nodeId: number, i: number) => nodeId * VISITED_KEY_MULT + i;
 
     while (stack.length) {
       const st = stack.pop()!;
@@ -1000,15 +1127,17 @@ export class EventBus<E extends EventMap> {
       const i = st.i;
 
       if (i === eSegs.length) {
-        for (const entry of node.end) {
-          out.push({ entry, params: st.params });
+        if (node.end.length) {
+          for (const entry of node.end) {
+            out.push({ entry, params: st.params, paramsKey: st.paramsKey });
+          }
         }
 
         if (node.deep) {
           const k = keyOf(node.deep.id, i);
           if (!expanded.has(k)) {
             expanded.add(k);
-            stack.push({ i, node: node.deep, params: st.params });
+            stack.push({ i, node: node.deep, params: st.params, paramsKey: st.paramsKey });
           }
         }
         continue;
@@ -1020,36 +1149,42 @@ export class EventBus<E extends EventMap> {
         const k0 = keyOf(node.deep.id, i);
         if (!expanded.has(k0)) {
           expanded.add(k0);
-          stack.push({ i, node: node.deep, params: st.params });
+          stack.push({ i, node: node.deep, params: st.params, paramsKey: st.paramsKey });
         }
-        stack.push({ i: i + 1, node: node.deep, params: st.params });
+        stack.push({ i: i + 1, node: node.deep, params: st.params, paramsKey: st.paramsKey });
       }
 
       const exactNext = node.exact.get(seg);
       if (exactNext) {
-        stack.push({ i: i + 1, node: exactNext, params: st.params });
+        stack.push({ i: i + 1, node: exactNext, params: st.params, paramsKey: st.paramsKey });
       }
 
       if (node.star) {
-        stack.push({ i: i + 1, node: node.star, params: st.params });
+        stack.push({ i: i + 1, node: node.star, params: st.params, paramsKey: st.paramsKey });
+      }
+
+      if (node.globs?.length) {
+        for (const g of node.globs) {
+          if (g.re.test(seg)) {
+            stack.push({ i: i + 1, node: g.node, params: st.params, paramsKey: st.paramsKey });
+          }
+        }
       }
 
       if (node.params?.length) {
         for (const p of node.params) {
-          stack.push({
-            i: i + 1,
-            node: p.node,
-            params: { ...st.params, [p.key]: seg },
-          });
+          const nextParams = { ...st.params, [p.key]: seg };
+
+          const nextKey = st.paramsKey + '\u0000' + p.key + '=' + seg;
+          stack.push({ i: i + 1, node: p.node, params: nextParams, paramsKey: nextKey });
         }
       }
     }
   }
 
   /**
-   * @internal Remove a compiled pattern listener from the trie.
-   *
-   * Note: this does not currently prune empty nodes.
+   * Remove a pattern listener from the trie.
+   * This does not currently prune empty nodes.
    */
   private trieRemove(entry: CompiledPatternListener<E>, segs: CompiledSeg[]) {
     const root = this.patternTries.get(entry.separator);
@@ -1068,12 +1203,17 @@ export class EventBus<E extends EventMap> {
         node = node.exact.get(s.value);
         continue;
       }
-      if (s.type === 'wildcard') {
+      if (s.type === 'segWildcard') {
         node = node.star;
         continue;
       }
       if (s.type === 'deepWildcard') {
         node = node.deep;
+        continue;
+      }
+      if (s.type === 'glob') {
+        const found = node.globs?.find((x) => x.src === s.src);
+        node = found?.node;
         continue;
       }
       const found = node.params?.find((x) => x.key === s.key);
