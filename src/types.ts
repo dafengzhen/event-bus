@@ -311,23 +311,26 @@ export type OnOptions = {
 
 /**
  * Pattern-based event handler function.
- * Unlike exact listeners, pattern handlers receive the matched event name
- * and extracted parameters in addition to the payload.
+ * Unlike exact listeners, pattern handlers receive the matched event name,
+ * extracted parameters, and optionally the emission context.
  *
- * The handler can be defined with either 3 parameters (event, payload, params)
- * or 4 parameters (event, payload, params, ctx) for access to the emission context.
+ * The handler can be defined with either 3 parameters or 4 parameters:
+ * - **3 parameters**: `(event, payload, params)` – basic pattern matching
+ * - **4 parameters**: `(event, payload, params, ctx)` – adds access to the emission context
  *
- * @template E - Event map type
+ * @template E - Event map type defining known event names and their payload types
  *
- * @param event - The full event name that triggered the pattern match
- *                (may be a known key of `E` or an arbitrary string not in the map)
- * @param payload - The payload associated with the emitted event
+ * @param event - The full event name that triggered the pattern match.
+ *                This may be a known key of `E` or an arbitrary string not defined in the map.
+ * @param payload - The data associated with the emitted event.
+ *                  Type is the union of all payload types from `E` since the actual event is dynamic.
  * @param params - Parameters extracted from the pattern match.
- *                 Keys correspond to named parameters (`:param`) in the pattern,
- *                 values are the matched segment strings.
- * @param ctx - Optional emission context for advanced control.
- *              Provides access to meta, blocking capability, and other matched listeners.
- *              Only available when handler defines 4 parameters.
+ *                 Keys correspond to named placeholders (`:param`) in the subscription pattern,
+ *                 values are the matched URL-style segments as strings.
+ * @param ctx - Optional emission context for advanced control flows.
+ *              Provides access to emission metadata, blocking capability,
+ *              and visibility into other listeners matched for this event.
+ *              **This parameter is only available when the handler explicitly defines 4 parameters.**
  *
  * @example
  * ```ts
@@ -340,19 +343,22 @@ export type OnOptions = {
  * // Pattern handler with context access
  * const handlerWithCtx: PatternHandler<Events> = (event, payload, params, ctx) => {
  *   console.log(`Processing ${event} with trace ID: ${ctx.meta.traceId}`);
- *   if (!isAuthorized(ctx)) ctx.block();
+ *
+ *   if (!isAuthorized(ctx)) {
+ *     ctx.block(); // Prevent further listener execution
+ *   }
  * };
  * emitter.on('admin.:action', handlerWithCtx);
  * ```
+ *
+ * @see EmitContext For detailed documentation on available context methods and properties
  */
-export type PatternHandler<E extends EventMap> =
-  | ((event: string, payload: any, params: Record<string, string>) => void)
-  | ((
-      event: string,
-      payload: any,
-      params: Record<string, string>,
-      ctx: EmitContext<E, keyof E>,
-    ) => void);
+export type PatternHandler<E extends EventMap> = (
+  event: string,
+  payload: E[keyof E],
+  params: Record<string, string>,
+  ctx?: EmitContext<E, keyof E>,
+) => void;
 
 /**
  * Information about a matched pattern listener during emission.
