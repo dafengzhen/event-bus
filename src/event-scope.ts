@@ -156,10 +156,6 @@ export class EventScope<E extends EventMap> {
    * If the scope is already destroyed, this is a no-op.
    */
   flushOffs(): void {
-    if (this.destroyed) {
-      return;
-    }
-
     const arr = this.offs.splice(0);
     for (const off of arr) {
       try {
