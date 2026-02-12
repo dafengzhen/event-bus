@@ -1226,9 +1226,23 @@ export class EventBus<E extends EventMap> {
    * @internal
    */
   private rethrowAsync(err: unknown) {
-    queueMicrotask(() => {
+    if (typeof queueMicrotask !== 'undefined') {
+      queueMicrotask(() => {
+        throw err;
+      });
+      return;
+    }
+
+    if (typeof Promise !== 'undefined' && typeof Promise.resolve === 'function') {
+      Promise.resolve().then(() => {
+        throw err;
+      });
+      return;
+    }
+
+    setTimeout(() => {
       throw err;
-    });
+    }, 0);
   }
 
   /**

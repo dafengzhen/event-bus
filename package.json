@@ -1,6 +1,6 @@
 {
   "name": "@dafengzhen/event-bus",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "A lightweight TypeScript event bus with strong typing, middleware pipeline, and pattern-based event listeners.",
   "keywords": [
     "event-bus",
@@ -72,8 +72,8 @@
     "husky": "^9.1.7",
     "jest": "^30.2.0",
     "jest-environment-jsdom": "^30.2.0",
-    "oxfmt": "^0.31.0",
-    "oxlint": "^1.46.0",
+    "oxfmt": "^0.32.0",
+    "oxlint": "^1.47.0",
     "parcel": "^2.16.4",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
