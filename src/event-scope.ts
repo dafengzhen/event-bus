@@ -3,229 +3,292 @@ import type {
   EmitOptions,
   EventMap,
   Listener,
-  Middleware,
+  MiddlewareAsync,
+  MiddlewareSync,
   OnOptions,
+  PatternHandler,
   UseOptions,
 } from './types.ts';
 
+/**
+ * Auto-incrementing counter used to assign a unique identifier to each scope instance.
+ */
 let SCOPE_ID = 0;
 
 /**
- * A lifecycle-bound scope for an {@link EventBus}.
+ * A function that, when called, removes a previously registered listener or middleware.
+ */
+type Off = () => void;
+
+/**
+ * A scoped context for managing the lifecycle of event listeners and middleware.
  *
- * `EventScope` provides a convenient way to register listeners/middlewares and ensure they are
- * automatically cleaned up when the scope is destroyed. Scopes can be nested; destroying a scope
- * will destroy all of its child scopes first.
+ * Listeners and middleware registered through a scope are automatically tracked.
+ * When the scope is destroyed, all tracked registrations are removed from the
+ * underlying {@link EventBus}. Scopes can be nested, forming a tree where destroying
+ * a parent scope also destroys all its children.
  *
- * The scope is also attached to emitted events through `metaPatch.scope`, allowing downstream
- * logic/middlewares to inspect the originating scope.
+ * Scopes are typically obtained via {@link EventBus.createScope} or
+ * {@link EventBus.withScope}.
  *
- * @typeParam E - Event map type (`eventName -> payload type`).
+ * @typeParam E - The event map type.
  *
  * @example
  * ```ts
  * const scope = bus.createScope();
  *
- * scope.on('tick', () => console.log('tick'));
- * scope.use((ctx, next) => next());
+ * scope.on('user:login', (payload) => {
+ *   console.log('Scoped listener:', payload.userId);
+ * });
  *
- * scope.emit('tick');
- * scope.destroy(); // auto-unregisters listeners and middlewares registered via this scope
- * ```
- *
- * @example
- * ```ts
- * await scope.withChild(async (child) => {
- *   child.on('message', (p) => console.log(p));
- *   child.emit('message', { text: 'hi' });
- * }); // child is destroyed automatically
+ * // All scope listeners are removed.
+ * scope.destroy();
  * ```
  *
  * @author dafengzhen
  */
 export class EventScope<E extends EventMap> {
   /**
-   * Monotonically increasing identifier for this scope instance.
-   * Useful for debugging/tracing.
+   * Unique identifier for this scope, useful for debugging and logging.
    */
   readonly id = ++SCOPE_ID;
 
   /**
-   * Child scopes created under this scope. Destroying this scope will destroy all children first.
+   * Whether this scope has been destroyed. A destroyed scope cannot register
+   * new listeners or emit events.
    */
-  private children = new Set<EventScope<E>>();
+  get isDestroyed(): boolean {
+    return this.destroyed;
+  }
 
   /**
-   * Whether this scope has been destroyed. A destroyed scope can no longer be used.
+   * Set of child scopes created from this scope.
+   */
+  private readonly children = new Set<EventScope<E>>();
+
+  /**
+   * Internal flag indicating whether this scope has been destroyed.
    */
   private destroyed = false;
 
   /**
-   * Cleanup callbacks registered by this scope. Each function should undo a side effect
-   * such as removing a listener, middleware, timer, etc.
+   * Set of unregistration functions for all listeners and middleware
+   * that were registered through this scope.
    */
-  private offs: Array<() => void> = [];
+  private readonly offs = new Set<Off>();
 
   /**
-   * Creates a new scope bound to the given bus.
+   * Creates a new scope bound to the given event bus.
    *
-   * @param bus - The owning event bus.
-   * @param parent - Optional parent scope. If provided, this scope will be registered as a child
-   * of the parent and will be destroyed when the parent is destroyed.
+   * @param bus - The event bus this scope belongs to.
+   * @param parent - An optional parent scope. If provided, this scope becomes a child
+   *   of the parent and will be destroyed when the parent is destroyed.
    */
   constructor(
-    private bus: EventBus<E>,
+    private readonly bus: EventBus<E>,
     readonly parent?: EventScope<E>,
   ) {
+    parent?.assertAlive();
     parent?.addChild(this);
   }
 
   /**
-   * Destroys this scope.
+   * Destroys this scope and all its descendant scopes.
    *
-   * Destruction is idempotent. On first call it:
-   * 1) Marks the scope destroyed
-   * 2) Destroys all child scopes
-   * 3) Flushes all registered cleanups
-   * 4) Detaches from the parent (if any)
+   * All listeners and middleware registered through this scope (or any child scope)
+   * are removed from the event bus. After destruction, the scope is no longer usable.
    */
   destroy(): void {
     if (this.destroyed) {
       return;
     }
+
     this.destroyed = true;
 
-    for (const c of this.children) {
-      c.destroy();
-    }
+    // Take a snapshot and clear before destroying children to avoid mutation during iteration.
+    const children = [...this.children];
     this.children.clear();
+
+    for (const child of children) {
+      child.destroy();
+    }
 
     this.flushOffs();
     this.parent?.removeChild(this);
   }
 
   /**
-   * Emits an event from this scope.
+   * Emits an event through the underlying event bus, automatically attaching
+   * this scope to the event's metadata so receivers can identify the source scope.
    *
-   * The emitted event will include `metaPatch.scope = this`, merged with any provided `metaPatch`.
-   *
-   * @typeParam K - Event key.
-   * @param event - Event name.
-   * @param payload - Event payload.
-   * @param options - Emit options forwarded to the bus.
-   * @throws Error if this scope is already destroyed.
+   * @param event - The event key to emit.
+   * @param payload - The event payload.
+   * @param options - Optional emission options.
    */
-  emit<K extends keyof E>(event: K, payload?: E[K], options?: EmitOptions): void {
+  emit<K extends keyof E>(event: K, payload: E[K], options?: EmitOptions): void;
+  /**
+   * Emits an event with only options (no payload).
+   *
+   * @param event - The event key to emit.
+   * @param options - Emission options.
+   */
+  emit<K extends keyof E>(event: K, options: EmitOptions): void;
+  emit<K extends keyof E>(
+    event: K,
+    payloadOrOptions?: E[K] | EmitOptions,
+    options?: EmitOptions,
+  ): void {
     this.assertAlive();
-    this.bus.emit(event, payload, {
-      ...options,
-      metaPatch: {
-        ...options?.metaPatch,
-        scope: this,
-      },
-    });
+
+    const { emitOptions, optionsOnly, payload } = this.parseEmitArgs<E[K]>(
+      payloadOrOptions,
+      options,
+    );
+    const scopedOptions = this.withScopeMeta(emitOptions);
+
+    if (optionsOnly) {
+      this.bus.emit(event, scopedOptions);
+      return;
+    }
+
+    this.bus.emit(event, payload as E[K], scopedOptions);
   }
 
   /**
-   * Emits an event asynchronously from this scope.
+   * Asynchronously emits an event through the underlying event bus, attaching
+   * this scope's metadata.
    *
-   * The emitted event will include `metaPatch.scope = this`, merged with any provided `metaPatch`.
-   *
-   * @typeParam K - Event key.
-   * @param event - Event name.
-   * @param payload - Event payload.
-   * @param options - Emit options forwarded to the bus.
-   * @returns A promise that resolves when all async dispatch completes.
-   * @throws Error if this scope is already destroyed.
+   * @param event - The event key to emit.
+   * @param payload - The event payload.
+   * @param options - Optional emission options.
+   * @returns A Promise that resolves when all middleware and listeners have completed.
    */
-  emitAsync<K extends keyof E>(event: K, payload?: E[K], options?: EmitOptions): Promise<void> {
+  emitAsync<K extends keyof E>(event: K, payload: E[K], options?: EmitOptions): Promise<void>;
+  /**
+   * Asynchronously emits an event with only options (no payload).
+   *
+   * @param event - The event key to emit.
+   * @param options - Emission options.
+   * @returns A Promise that resolves when all middleware and listeners have completed.
+   */
+  emitAsync<K extends keyof E>(event: K, options: EmitOptions): Promise<void>;
+  emitAsync<K extends keyof E>(
+    event: K,
+    payloadOrOptions?: E[K] | EmitOptions,
+    options?: EmitOptions,
+  ): Promise<void> {
     this.assertAlive();
-    return this.bus.emitAsync(event, payload, {
-      ...options,
-      metaPatch: {
-        ...options?.metaPatch,
-        scope: this,
-      },
-    });
+
+    const { emitOptions, optionsOnly, payload } = this.parseEmitArgs<E[K]>(
+      payloadOrOptions,
+      options,
+    );
+    const scopedOptions = this.withScopeMeta(emitOptions);
+
+    if (optionsOnly) {
+      return this.bus.emitAsync(event, scopedOptions);
+    }
+
+    return this.bus.emitAsync(event, payload as E[K], scopedOptions);
   }
 
   /**
-   * Executes and clears all registered cleanup callbacks.
+   * Immediately invokes all tracked unregistration functions, removing all scope-managed
+   * listeners and middleware from the event bus.
    *
-   * Errors thrown by cleanup callbacks are swallowed to ensure all cleanups are attempted.
-   * If the scope is already destroyed, this is a no-op.
+   * This is called automatically during {@link destroy}. Invoking it manually allows
+   * clearing registrations without destroying the scope itself.
+   *
+   * Errors thrown by individual `off` functions are silently caught to ensure
+   * best-effort cleanup of all remaining registrations.
    */
   flushOffs(): void {
-    const arr = this.offs.splice(0);
-    for (const off of arr) {
+    const pending = [...this.offs];
+    this.offs.clear();
+
+    for (const off of pending) {
       try {
         off();
       } catch {
-        // ignore
+        // Keep cleanup best-effort and preserve the original behavior.
       }
     }
   }
 
   /**
-   * Subscribes to an event and registers the returned cleanup function in this scope.
+   * Registers an exact listener through the event bus and tracks it for automatic
+   * cleanup when this scope is destroyed.
    *
-   * When this scope is destroyed (or {@link flushOffs} is called), the subscription is removed.
-   *
-   * @typeParam K - Event key.
-   * @param event - Event name.
-   * @param listener - Event listener.
-   * @param options - Subscription options forwarded to the bus.
-   * @returns An `off()` function that removes the subscription.
-   * @throws Error if this scope is already destroyed.
+   * @param event - The event key to listen for.
+   * @param listener - The callback to invoke.
+   * @param options - Registration options.
+   * @returns A function that removes the listener (and untracks it from this scope).
    */
   on<K extends keyof E>(event: K, listener: Listener<E[K]>, options?: OnOptions): () => void {
     this.assertAlive();
-    const off = this.bus.on(event, listener, options);
-    this.offs.push(off);
-    return off;
+    return this.trackOff(this.bus.on(event, listener, options));
   }
 
   /**
-   * Subscribes to an event for a single invocation and registers the cleanup function in this scope.
+   * Registers a one-shot exact listener and tracks it for scope cleanup.
    *
-   * @typeParam K - Event key.
-   * @param event - Event name.
-   * @param listener - Event listener.
-   * @param options - Subscription options forwarded to the bus.
-   * @returns An `off()` function that cancels the one-time subscription.
-   * @throws Error if this scope is already destroyed.
+   * @param event - The event key.
+   * @param listener - The callback (invoked at most once).
+   * @param options - Registration options.
+   * @returns A function that removes the listener before it fires.
    */
   once<K extends keyof E>(event: K, listener: Listener<E[K]>, options?: OnOptions): () => void {
     this.assertAlive();
-    const off = this.bus.once(event, listener, options);
-    this.offs.push(off);
-    return off;
+    return this.trackOff(this.bus.once(event, listener, options));
   }
 
   /**
-   * Registers an arbitrary cleanup callback to be executed when the scope is flushed/destroyed.
+   * Registers a one-shot pattern listener and tracks it for scope cleanup.
    *
-   * This is useful when you create side effects outside of {@link on}, {@link once}, or {@link use},
-   * but still want them cleaned up with the scope.
+   * @param pattern - The pattern to match.
+   * @param handler - The handler (invoked at most once).
+   * @param options - Registration options.
+   * @returns A function that removes the listener.
+   */
+  onceMatch(pattern: RegExp | string, handler: PatternHandler<E>, options?: OnOptions): () => void {
+    this.assertAlive();
+    return this.trackOff(this.bus.onceMatch(pattern, handler, options));
+  }
+
+  /**
+   * Registers a pattern listener and tracks it for scope cleanup.
    *
-   * @param off - Cleanup callback.
-   * @throws Error if this scope is already destroyed.
+   * @param pattern - The pattern to match.
+   * @param handler - The handler to invoke on match.
+   * @param options - Registration options.
+   * @returns A function that removes the listener.
+   */
+  onMatch(pattern: RegExp | string, handler: PatternHandler<E>, options?: OnOptions): () => void {
+    this.assertAlive();
+    return this.trackOff(this.bus.onMatch(pattern, handler, options));
+  }
+
+  /**
+   * Registers an external unregistration function to be tracked by this scope.
+   * When the scope is destroyed (or `flushOffs` is called), `off` will be invoked.
+   *
+   * This is used internally by the event bus when listeners are registered inside
+   * an active scope via `runWithScope`.
+   *
+   * @param off - The function to call to unregister the resource.
    */
   registerOff(off: () => void): void {
     this.assertAlive();
-    this.offs.push(off);
+    this.offs.add(off);
   }
 
   /**
-   * Runs a synchronous function within this scope as the "current scope" in the bus runtime.
+   * Executes a synchronous function within the context of this scope.
+   * Any listeners registered inside `fn` will be automatically bound to this scope.
    *
-   * Downstream code that relies on the runtime's current-scope tracking can access this scope
-   * while `fn` executes.
-   *
-   * @typeParam T - Return type of the function.
-   * @param fn - Function to execute.
-   * @returns The function result.
-   * @throws Error if this scope is already destroyed.
+   * @typeParam T - The return type of `fn`.
+   * @param fn - The function to execute.
+   * @returns The return value of `fn`.
    */
   run<T>(fn: () => T): T {
     this.assertAlive();
@@ -233,83 +296,201 @@ export class EventScope<E extends EventMap> {
   }
 
   /**
-   * Runs an asynchronous function within this scope as the "current scope" in the bus runtime.
+   * Executes an asynchronous function within the context of this scope.
+   * Any listeners registered inside `fn` will be automatically bound to this scope.
    *
-   * @typeParam T - Resolved return type.
-   * @param fn - Async function to execute.
-   * @returns A promise resolving to the function result.
-   * @throws Error if this scope is already destroyed.
+   * @typeParam T - The resolution type.
+   * @param fn - The async function to execute.
+   * @returns A Promise resolving to the return value of `fn`.
    */
-  async runAsync<T>(fn: () => Promise<T>): Promise<T> {
+  runAsync<T>(fn: () => Promise<T>): Promise<T> {
     this.assertAlive();
     return this.bus.runtime.runWithScopeAsync(this, fn);
   }
 
   /**
-   * Installs a middleware and registers the returned cleanup function in this scope.
+   * Registers synchronous middleware through the event bus and tracks it for scope cleanup.
    *
-   * @param mw - Middleware to install.
-   * @param options - Middleware installation options forwarded to the bus.
-   * @returns An `off()` function that uninstalls the middleware.
-   * @throws Error if this scope is already destroyed.
+   * @param mw - The middleware function.
+   * @param options - Options to filter events.
+   * @returns A function that removes the middleware.
    */
-  use(mw: Middleware<E>, options?: UseOptions<E>): () => void {
+  use(mw: MiddlewareSync<E>, options?: UseOptions<E>): () => void {
     this.assertAlive();
-    const off = this.bus.use(mw, options);
-    this.offs.push(off);
-    return off;
+    return this.trackOff(this.bus.use(mw, options));
   }
 
   /**
-   * Creates a child scope, runs the callback with it, and always destroys the child afterwards.
+   * Registers asynchronous middleware through the event bus and tracks it for scope cleanup.
    *
-   * This is a structured-concurrency style helper: any resources registered in the child scope
-   * are guaranteed to be cleaned up when the callback finishes (even if it throws).
+   * @param mw - The async middleware function.
+   * @param options - Options to filter events.
+   * @returns A function that removes the middleware.
+   */
+  useAsync(mw: MiddlewareAsync<E>, options?: UseOptions<E>): () => void {
+    this.assertAlive();
+    return this.trackOff(this.bus.useAsync(mw, options));
+  }
+
+  /**
+   * Creates a temporary child scope, executes the provided function within its context,
+   * and automatically destroys the child scope when done (even on error).
    *
-   * @typeParam T - Return type of the callback.
-   * @param fn - Callback invoked with the newly created child scope.
-   * @returns The callback result.
-   * @throws Error if this scope is already destroyed.
+   * @typeParam T - The return type of `fn`.
+   * @param fn - The function to execute with the child scope.
+   * @returns A Promise resolving to the return value of `fn`.
+   *
+   * @example
+   * ```ts
+   * await parentScope.withChild(async (childScope) => {
+   *   childScope.on('user:login', handler);
+   *   // ... do work ...
+   *   // Child scope is automatically destroyed when this callback completes.
+   * });
+   * ```
    */
   async withChild<T>(fn: (scope: EventScope<E>) => Promise<T> | T): Promise<T> {
     this.assertAlive();
     const child = this.bus.createScope(this);
 
     try {
-      return await fn(child);
+      return await child.run(() => fn(child));
     } finally {
       child.destroy();
     }
   }
 
   /**
-   * Adds a child scope to this scope's child set.
+   * Adds a child scope to the tracked set. The child will be destroyed when this scope
+   * is destroyed.
    *
-   * @param child - Child scope to add.
-   * @internal
+   * @param child - The child scope to track.
    */
-  private addChild(child: EventScope<E>) {
+  private addChild(child: EventScope<E>): void {
+    this.assertAlive();
     this.children.add(child);
   }
 
   /**
-   * Throws if the scope has already been destroyed.
-   *
-   * @throws Error if destroyed.
+   * Throws an error if this scope has been destroyed, preventing further use.
    */
-  private assertAlive() {
+  private assertAlive(): void {
     if (this.destroyed) {
       throw new Error('EventScope already destroyed.');
     }
   }
 
   /**
-   * Removes a child scope from this scope's child set.
+   * Parses the overloaded arguments of `emit`/`emitAsync` into a normalized structure
+   * indicating whether the call was options-only and what the payload and options are.
    *
-   * @param child - Child scope to remove.
-   * @internal
+   * @typeParam P - The payload type.
+   * @param payloadOrOptions - Either the payload or the options object.
+   * @param options - The options object, if the first argument was the payload.
+   * @returns An object with `payload`, `emitOptions`, and an `optionsOnly` flag.
    */
-  private removeChild(child: EventScope<E>) {
+  private parseEmitArgs<P>(
+    payloadOrOptions?: EmitOptions | P,
+    options?: EmitOptions,
+  ): {
+    emitOptions: EmitOptions | undefined;
+    optionsOnly: boolean;
+    payload: P | undefined;
+  } {
+    if (options !== undefined) {
+      return {
+        emitOptions: options,
+        optionsOnly: false,
+        payload: payloadOrOptions as P | undefined,
+      };
+    }
+
+    if (looksLikeEmitOptions(payloadOrOptions)) {
+      return {
+        emitOptions: payloadOrOptions,
+        optionsOnly: true,
+        payload: undefined,
+      };
+    }
+
+    return {
+      emitOptions: undefined,
+      optionsOnly: false,
+      payload: payloadOrOptions as P | undefined,
+    };
+  }
+
+  /**
+   * Removes a child scope from the tracked set. Called when the child is destroyed.
+   *
+   * @param child - The child scope to remove.
+   */
+  private removeChild(child: EventScope<E>): void {
     this.children.delete(child);
   }
+
+  /**
+   * Wraps a raw unregistration function so that it is both tracked by this scope
+   * and idempotent (multiple calls only invoke the underlying `off` once).
+   *
+   * @param off - The raw unregistration function from the event bus.
+   * @returns An idempotent unregistration function that also untracks itself from the scope.
+   */
+  private trackOff(off: Off): Off {
+    this.offs.add(off);
+
+    let done = false;
+    return () => {
+      if (done) {
+        return;
+      }
+
+      done = true;
+      this.offs.delete(off);
+      off();
+    };
+  }
+
+  /**
+   * Merges this scope instance into the `metaPatch` of the emit options so that
+   * receivers can identify which scope emitted the event.
+   *
+   * @param options - The original emit options (may be undefined).
+   * @returns New emit options with the scope injected into `metaPatch`.
+   */
+  private withScopeMeta(options?: EmitOptions): EmitOptions {
+    return {
+      ...options,
+      metaPatch: {
+        ...options?.metaPatch,
+        scope: this,
+      },
+    };
+  }
+}
+
+/**
+ * Safe wrapper around `Object.prototype.hasOwnProperty.call`.
+ *
+ * @param value - The object to check.
+ * @param key - The property key.
+ * @returns `true` if the object has the own property.
+ */
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+/**
+ * Heuristic to determine if a value looks like an {@link EmitOptions} object
+ * by checking for the presence of known emit option keys.
+ *
+ * @param value - The value to test.
+ * @returns `true` if the value likely represents emit options.
+ */
+function looksLikeEmitOptions(value: unknown): value is EmitOptions {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  return hasOwn(value, 'sticky') || hasOwn(value, 'stickyMode') || hasOwn(value, 'metaPatch');
 }
