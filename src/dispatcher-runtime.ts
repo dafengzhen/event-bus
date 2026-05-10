@@ -1,110 +1,143 @@
 import type { EventScope } from './event-scope.ts';
-import type { EventMap } from './types.ts';
+import type { EventMap, MaybePromise, ScopeFrame, ScopeStorage } from './types.ts';
 
 /**
- * Internal frame representing a scope pushed onto the runtime stack.
- * Each frame links to its {@link EventScope} instance.
+ * Manages the execution context stack for EventScope instances.
  *
- * @typeParam E - The event map type.
- */
-type ScopeFrame<E extends EventMap> = {
-  readonly scope: EventScope<E>;
-};
-
-/**
- * Manages a stack of active {@link EventScope} instances, providing the mechanism
- * for scope-aware listener lifecycle management.
+ * The DispatcherRuntime is responsible for tracking which scope is currently
+ * active so that listener registrations can be automatically bound to the
+ * correct scope for cleanup. It supports two modes:
  *
- * When listeners are registered inside a `runWithScope` callback, they are automatically
- * bound to the active scope and cleaned up when that scope is destroyed.
+ * - **Stack-based**: Uses an internal array-based stack (default).
+ * - **Storage-based**: Delegates scope storage to an external `ScopeStorage`
+ *   implementation (e.g., `AsyncLocalStorage` for async context tracking).
  *
  * @typeParam E - The event map type.
  *
  * @example
- * ```ts
+ * ```typescript
+ * // Stack-based (default)
  * const runtime = new DispatcherRuntime<MyEvents>();
- * const scope = new EventScope(bus);
  *
- * runtime.runWithScope(scope, () => {
- *   // Any listeners registered here are bound to `scope`.
- *   bus.on('user:login', handler);
+ * // AsyncLocalStorage-based (Node.js)
+ * import { AsyncLocalStorage } from 'node:async_hooks';
+ * const als = new AsyncLocalStorage<ScopeFrame<MyEvents>>();
+ * const runtime = new DispatcherRuntime<MyEvents>({
+ *   getStore: () => als.getStore(),
+ *   run: (frame, fn) => als.run(frame, fn),
  * });
- *
- * scope.destroy(); // All listeners registered above are now removed.
  * ```
  *
  * @author dafengzhen
  */
 export class DispatcherRuntime<E extends EventMap> {
   /**
-   * Stack of active scope frames. The top of the stack represents the currently
-   * active scope (if any).
+   * Internal stack of scope frames used when no external storage is provided.
+   * The last element represents the current active scope.
    */
   private readonly scopeStack: Array<ScopeFrame<E>> = [];
 
   /**
-   * Returns the currently active scope, or `undefined` if no scope is active.
+   * Creates a new DispatcherRuntime.
    *
-   * @returns The active {@link EventScope}, or `undefined`.
+   * @param storage - Optional external scope storage for async context propagation.
+   */
+  constructor(private readonly storage?: ScopeStorage<E> | undefined) {}
+
+  /**
+   * Returns the currently active EventScope, or `undefined` if none is active.
+   *
+   * If an external storage is configured, it is queried first. Otherwise,
+   * the top of the internal scope stack is returned.
+   *
+   * @returns The current scope, or `undefined`.
    */
   getScope(): EventScope<E> | undefined {
-    return this.scopeStack[this.scopeStack.length - 1]?.scope;
+    return this.storage?.getStore()?.scope ?? this.scopeStack[this.scopeStack.length - 1]?.scope;
   }
 
   /**
-   * Executes a synchronous or asynchronous function within the context of the given scope.
-   * The scope is pushed onto the stack before `fn` is called and popped afterwards,
-   * even if `fn` throws or returns a rejected Promise.
+   * Executes a function within the given scope, returning a Promise.
    *
-   * @typeParam T - The return type of `fn`.
-   * @param scope - The scope to activate.
-   * @param fn - The function to execute within the scope.
-   * @returns The return value of `fn` (or a Promise resolving to it).
+   * @typeParam T - The return type of the function.
+   * @param scope - The scope to make active during execution.
+   * @param fn - The function to execute.
+   * @returns A promise resolving to the function's return value.
+   * @throws If the scope has been disposed.
    */
   runWithScope<T>(scope: EventScope<E>, fn: () => Promise<T>): Promise<T>;
+  /**
+   * Executes a function within the given scope, returning the result directly.
+   *
+   * @typeParam T - The return type of the function.
+   * @param scope - The scope to make active during execution.
+   * @param fn - The synchronous function to execute.
+   * @returns The function's return value.
+   * @throws If the scope has been disposed.
+   */
   runWithScope<T>(scope: EventScope<E>, fn: () => T): T;
-  runWithScope<T>(scope: EventScope<E>, fn: () => Promise<T> | T): Promise<T> | T {
+  runWithScope<T>(scope: EventScope<E>, fn: () => MaybePromise<T>): MaybePromise<T> {
+    this.assertScopeAlive(scope);
+
     const frame: ScopeFrame<E> = { scope };
+
+    if (this.storage) {
+      return this.storage.run(frame, fn);
+    }
+
     this.scopeStack.push(frame);
 
-    let result: Promise<T> | T;
+    let result: MaybePromise<T>;
     try {
       result = fn();
     } catch (error) {
-      this.removeFrame(frame);
+      this.removeScopeFrame(frame);
       throw error;
     }
 
     if (isPromiseLike<T>(result)) {
       return Promise.resolve(result).finally(() => {
-        this.removeFrame(frame);
+        this.removeScopeFrame(frame);
       });
     }
 
-    this.removeFrame(frame);
+    this.removeScopeFrame(frame);
     return result;
   }
 
   /**
-   * Convenience method to execute an async function within a scope.
-   * Equivalent to `runWithScope(scope, fn)` but explicitly typed for async use cases.
+   * Executes an async function within the given scope, always returning a Promise.
    *
-   * @typeParam T - The return type of `fn`.
-   * @param scope - The scope to activate.
-   * @param fn - The async function to execute.
-   * @returns A Promise resolving to the return value of `fn`.
+   * This is a convenience wrapper around `runWithScope` that ensures the return
+   * value is always a Promise regardless of whether the function is sync or async.
+   *
+   * @typeParam T - The return type of the function.
+   * @param scope - The scope to make active during execution.
+   * @param fn - The function to execute (sync or async).
+   * @returns A promise resolving to the function's return value.
    */
-  runWithScopeAsync<T>(scope: EventScope<E>, fn: () => Promise<T>): Promise<T> {
-    return this.runWithScope(scope, fn);
+  runWithScopeAsync<T>(scope: EventScope<E>, fn: () => MaybePromise<T>): Promise<T> {
+    return Promise.resolve(this.runWithScope(scope, fn));
   }
 
   /**
-   * Removes a scope frame from the stack. Uses `lastIndexOf` to safely handle
-   * cases where the frame may have already been removed (e.g., by a parent scope cleanup).
+   * Asserts that the given scope has not been disposed.
    *
-   * @param frame - The frame to remove.
+   * @param scope - The scope to check.
+   * @throws If the scope has been disposed.
    */
-  private removeFrame(frame: ScopeFrame<E>): void {
+  private assertScopeAlive(scope: EventScope<E>): void {
+    if (scope.isDisposed) {
+      throw new Error('EventScope has been disposed.');
+    }
+  }
+
+  /**
+   * Removes a scope frame from the internal stack.
+   *
+   * @param frame - The scope frame to remove.
+   */
+  private removeScopeFrame(frame: ScopeFrame<E>): void {
     const index = this.scopeStack.lastIndexOf(frame);
     if (index !== -1) {
       this.scopeStack.splice(index, 1);
@@ -113,12 +146,11 @@ export class DispatcherRuntime<E extends EventMap> {
 }
 
 /**
- * Checks whether a value is "thenable" (has a `.then` method), indicating it is
- * a Promise-like object.
+ * Checks whether a value is Promise-like (has a `.then` method).
  *
- * @typeParam T - The expected resolution type.
- * @param value - The value to test.
- * @returns `true` if the value is promise-like.
+ * @typeParam T - The resolved type of the potential promise.
+ * @param value - The value to check.
+ * @returns `true` if the value is Promise-like, `false` otherwise.
  */
 function isPromiseLike<T = unknown>(value: unknown): value is PromiseLike<T> {
   return (
