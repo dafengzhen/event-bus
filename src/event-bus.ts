@@ -25,141 +25,129 @@ import type {
 import { DispatcherRuntime } from './dispatcher-runtime.ts';
 import { EventScope } from './event-scope.ts';
 
-/**
- * Sentinel value returned when no sticky event is found for replay.
- * Frozen to prevent mutation.
- */
+/** Default replay result indicating no sticky event was found. */
 const NO_REPLAY: ReplayOneResult = { found: false };
 
-/**
- * Frozen empty metadata object shared across replay contexts
- * to avoid unnecessary allocations.
- */
+/** Frozen empty object used as default metadata for replay contexts. */
 const EMPTY_META = Object.freeze({}) as Readonly<Record<string, unknown>>;
 
+/** Cached empty array returned when no pattern listeners match. */
+const NO_PATTERN_MATCHES: MatchedPattern<any>[] = [];
+
+/** Symbol used to tag versioned matched pattern arrays for invalidation tracking. */
+const MATCHED_PATTERN_VERSION = Symbol('EventBus.matchedPatternVersion');
+
 /**
- * A typed event bus providing dispatch, middleware, pattern matching,
- * sticky events, and scoped listener management.
+ * Extended array type that carries a version stamp used to detect stale
+ * pattern listener snapshots during dispatch.
+ */
+type VersionedMatchedPatterns<E extends EventMap> = MatchedPattern<E>[] & {
+  [MATCHED_PATTERN_VERSION]?: number;
+};
+
+/**
+ * A type-safe, high-performance event bus with support for exact and
+ * pattern-based listeners, middleware pipelines, sticky events, scoped
+ * listener lifecycles, and asynchronous dispatch.
  *
- * @typeParam E - The event map type mapping event keys to their payload types.
+ * @typeParam E - A mapping from event keys to their payload types.
  *
  * @example
- * ```typescript
- * interface MyEvents {
+ * ```ts
+ * type MyEvents = {
  *   'user:login': { userId: string };
  *   'user:logout': { userId: string };
- * }
+ * };
  *
- * const bus = new EventBus<MyEvents>();
+ * const bus = new EventBus<MyEvents>({ logErrors: true });
+ *
  * bus.on('user:login', (payload, ctx) => {
  *   console.log(`User ${payload.userId} logged in`);
  * });
- * bus.emit('user:login', { userId: '123' });
+ *
+ * bus.emit('user:login', { userId: 'abc123' });
  * ```
  *
  * @author dafengzhen
  */
 export class EventBus<E extends EventMap> {
   /**
-   * Optional error handler invoked when listener or middleware errors occur.
-   * If not provided, errors are re-thrown asynchronously via `queueMicrotask`.
+   * Optional callback invoked when a listener or middleware throws an error.
+   * If not provided, errors are re-thrown asynchronously via `queueMicrotask`
+   * or `setTimeout` to avoid disrupting the dispatch loop.
    */
   readonly onError?: ((e: unknown) => void) | undefined;
 
   /**
-   * The dispatcher runtime managing scope-aware execution context.
+   * The dispatcher runtime responsible for managing scoped execution contexts
+   * and asynchronous dispatching.
    */
   readonly runtime: DispatcherRuntime<E>;
 
   /**
-   * Whether to clear the global DFA compilation cache on disposal.
+   * Whether to clear the global regex-derivative compile cache when the
+   * EventBus is disposed.
    */
   private readonly clearGlobalCacheOnDispose: boolean;
 
-  /**
-   * Cache of compiled DFA matchers keyed by pattern string.
-   * Avoids recompilation of identical patterns.
-   */
+  /** Internal cache of compiled DFA matchers keyed by pattern string. */
   private readonly dfaCache = new Map<string, Matcher>();
 
-  /**
-   * Flag indicating whether this bus instance has been disposed.
-   * Once disposed, all operations throw an error.
-   */
+  /** Whether the EventBus has been disposed and should no longer be used. */
   private disposed = false;
 
-  /**
-   * Monotonically increasing sequence number for emit operations.
-   * Used to assign unique IDs to emitted events.
-   */
+  /** Monotonically increasing sequence number for emit calls. */
   private emitSequence = 0;
 
-  /**
-   * Map of exact event key listeners, keyed by event name.
-   * Each value is a priority-sorted array of listener entries.
-   */
+  /** Map of exact event listeners keyed by event name. */
   private readonly exactListeners = new Map<keyof E, Array<StoredExactListenerEntry<E>>>();
 
-  /**
-   * Monotonically increasing sequence number for listener registration.
-   * Used to maintain insertion order for listeners with equal priority.
-   */
+  /** Monotonically increasing sequence number for listener registration order. */
   private listenerSequence = 0;
 
-  /**
-   * Whether to log errors to console.error in addition to calling onError.
-   */
+  /** Whether to log errors to the console before invoking onError. */
   private readonly logErrors: boolean;
 
-  /**
-   * Registered middleware entries in registration order.
-   * Middleware are executed sequentially before listener dispatch.
-   */
+  /** Ordered list of registered middleware entries. */
   private middlewares: Array<MiddlewareEntry<E>> = [];
 
-  /**
-   * Registered pattern listeners sorted by priority (high to low) and sequence.
-   */
+  /** Ordered list of compiled pattern listener entries. */
   private patternListeners: Array<CompiledPatternListenerEntry<E>> = [];
 
-  /**
-   * Sticky events keyed by exact event string (for pattern replay).
-   * Each key maps to an array of sticky event payloads.
-   */
+  /** Version counter incremented whenever pattern listeners are added or removed. */
+  private patternListenerVersion = 0;
+
+  /** Map of sticky events for pattern-based replay, keyed by event string. */
   private stickyEvents = new Map<string, StickyEvent[]>();
 
-  /**
-   * Sticky events keyed by exact event key (for exact listener replay).
-   * Each key maps to an array of sticky event payloads.
-   */
+  /** Map of sticky events for exact-match replay, keyed by event key. */
   private stickyExact = new Map<keyof E, StickyEvent[]>();
 
-  /**
-   * Maximum number of sticky events retained per exact event key.
-   */
+  /** Maximum number of sticky events retained per exact event key. */
   private readonly stickyExactMax: number;
 
-  /**
-   * Maximum number of sticky event keys retained globally.
-   */
+  /** Maximum total number of sticky event keys retained for pattern replay. */
   private readonly stickyMax: number;
 
-  /**
-   * Maximum number of sticky events retained per pattern key.
-   */
+  /** Maximum sticky events retained per pattern-matched event key. */
   private readonly stickyPatternMaxPerKey: number;
 
   /**
    * Creates a new EventBus instance.
    *
-   * @param options - Configuration options for the event bus.
-   * @param options.onError - Optional callback invoked when listener/middleware errors occur.
-   * @param options.logErrors - Whether to log errors to console.error. Defaults to `true`.
-   * @param options.clearGlobalCacheOnDispose - Whether to clear the global DFA cache on disposal. Defaults to `false`.
-   * @param options.runtime - Custom dispatcher runtime for scope management. Defaults to a new `DispatcherRuntime`.
-   * @param options.stickyMax - Maximum number of sticky event keys retained globally. Defaults to `200`.
-   * @param options.stickyExactMax - Maximum sticky events retained per exact key. Defaults to `1`.
-   * @param options.stickyPatternMaxPerKey - Maximum sticky events retained per pattern key. Defaults to `stickyMax`.
+   * @param options - Configuration options for the EventBus.
+   * @param options.onError - Optional error handler for listener/middleware errors.
+   * @param options.logErrors - Whether to log errors to console. Defaults to `true`.
+   * @param options.clearGlobalCacheOnDispose - Whether to clear the global regex
+   *   compile cache on disposal. Defaults to `false`.
+   * @param options.runtime - Custom dispatcher runtime. Defaults to a new
+   *   `DispatcherRuntime`.
+   * @param options.stickyMax - Maximum number of sticky event keys for pattern
+   *   replay. Defaults to `200`.
+   * @param options.stickyExactMax - Maximum sticky events per exact event key.
+   *   Defaults to `1`.
+   * @param options.stickyPatternMaxPerKey - Maximum sticky events per pattern-
+   *   matched key. Defaults to `stickyMax`.
    */
   constructor(options?: EventBusOptions<E>) {
     this.onError = options?.onError;
@@ -174,8 +162,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Removes all listeners, middleware, and sticky events from the bus.
-   * The bus remains usable after this call.
+   * Removes all listeners, middleware, and sticky events from the EventBus.
+   * The instance remains usable after this call.
    */
   clearAll(): void {
     this.clearListeners();
@@ -185,24 +173,21 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Removes all registered listeners (both exact and pattern-based).
-   * Middleware and sticky events are preserved.
+   * Removes all exact and pattern listeners. Middleware and sticky events
+   * are preserved.
    */
   clearListeners(): void {
     this.exactListeners.clear();
     this.patternListeners = [];
+    this.patternListenerVersion++;
   }
 
   /**
-   * Creates a new EventScope that is a child of the provided parent scope
-   * (or the current active scope if no parent is specified).
+   * Creates a new {@link EventScope} that automatically unbinds listeners
+   * registered within it when disposed.
    *
-   * Listeners registered within this scope are automatically cleaned up
-   * when the scope is disposed.
-   *
-   * @param parent - Optional parent scope. If omitted, the current runtime scope is used.
+   * @param parent - Optional parent scope to nest within.
    * @returns A new EventScope instance.
-   * @throws If the bus has been disposed.
    */
   createScope(parent?: EventScope<E>): EventScope<E> {
     this.assertNotDisposed();
@@ -210,11 +195,9 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Disposes the event bus, releasing all resources.
-   *
-   * This removes all listeners, middleware, sticky events, clears the DFA cache,
-   * and optionally clears the global compilation cache. After disposal, all
-   * operations on this instance will throw an error.
+   * Disposes the EventBus, clearing all listeners, middleware, sticky events,
+   * and optionally the global regex compile cache. Once disposed, the instance
+   * cannot be used again.
    */
   dispose(): void {
     if (this.disposed) {
@@ -229,18 +212,17 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Synchronously emits an event to all matching listeners and middleware.
+   * Synchronously emits an event to all registered listeners and middleware.
    *
-   * @typeParam K - The event key type (inferred from the `event` argument).
+   * @typeParam K - The event key type.
    * @param event - The event key to emit.
-   * @param payload - The payload to pass to listeners and middleware.
+   * @param payload - The payload to pass to listeners.
    * @param options - Optional emit configuration.
-   * @param options.sticky - If `true`, the event is stored for replay to future listeners.
-   * @param options.stickyMode - Controls whether the event is consumed or replayed. Defaults to `'replay'`.
-   * @param options.metaPatch - Additional metadata merged into the context's `meta` property.
-   * @param options.origin - Optional origin identifier for the event.
-   * @throws If the bus has been disposed.
-   * @throws If an async middleware is encountered during synchronous emission.
+   * @param options.sticky - Whether to store this event for sticky replay.
+   * @param options.stickyMode - Sticky consumption mode (replay or consume).
+   * @param options.origin - Origin marker passed to listener contexts.
+   * @param options.metaPatch - Metadata merged into listener context meta.
+   * @throws If async middleware is encountered. Use {@link emitAsync} instead.
    */
   emit<K extends keyof E>(event: K, payload: E[K], options?: EmitOptions): void {
     this.assertNotDisposed();
@@ -253,15 +235,14 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Asynchronously emits an event to all matching listeners and middleware.
-   * Supports both sync and async middleware.
+   * Asynchronously emits an event, supporting both sync and async middleware.
    *
-   * @typeParam K - The event key type (inferred from the `event` argument).
+   * @typeParam K - The event key type.
    * @param event - The event key to emit.
-   * @param payload - The payload to pass to listeners and middleware.
-   * @param options - Optional emit configuration. See {@link emit} for details.
-   * @returns A promise that resolves when all middleware and listeners have completed.
-   * @throws If the bus has been disposed.
+   * @param payload - The payload to pass to listeners.
+   * @param options - Optional emit configuration.
+   * @returns A promise that resolves when all middleware and listeners have
+   *   completed.
    */
   async emitAsync<K extends keyof E>(
     event: K,
@@ -273,12 +254,11 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Removes a previously registered exact listener for the given event key.
+   * Unregisters an exact listener for the specified event.
    *
    * @typeParam K - The event key type.
-   * @param event - The event key from which to remove the listener.
+   * @param event - The event key to unregister from.
    * @param listener - The listener function to remove.
-   * @throws If the bus has been disposed.
    */
   off<K extends keyof E>(event: K, listener: Listener<E[K], E, K>): void {
     this.assertNotDisposed();
@@ -286,16 +266,16 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers a listener for the given event key.
+   * Registers a listener for the exact event key. The listener will be called
+   * every time the event is emitted.
    *
    * @typeParam K - The event key type.
    * @param event - The event key to listen for.
-   * @param listener - The listener function invoked when the event is emitted.
+   * @param listener - The listener function.
    * @param options - Optional registration configuration.
-   * @param options.priority - Listener priority. Higher values execute first. Defaults to `0`.
-   * @param options.consumeSticky - Override for sticky event consumption behavior.
-   * @returns An `Off` function that removes this listener when called.
-   * @throws If the bus has been disposed.
+   * @param options.priority - Higher priority listeners execute first. Defaults to `0`.
+   * @param options.consumeSticky - Whether to consume sticky events on replay.
+   * @returns A function that unregisters the listener when called.
    */
   on<K extends keyof E>(event: K, listener: Listener<E[K], E, K>, options?: OnOptions): Off {
     this.assertNotDisposed();
@@ -303,15 +283,14 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers a one-time listener for the given event key.
-   * The listener is automatically removed after its first invocation.
+   * Registers a one-time listener for the exact event key. The listener is
+   * automatically removed after its first invocation.
    *
    * @typeParam K - The event key type.
    * @param event - The event key to listen for.
-   * @param listener - The listener function invoked once when the event is emitted.
-   * @param options - Optional registration configuration. See {@link on} for details.
-   * @returns An `Off` function that removes this listener when called.
-   * @throws If the bus has been disposed.
+   * @param listener - The listener function.
+   * @param options - Optional registration configuration.
+   * @returns A function that unregisters the listener when called.
    */
   once<K extends keyof E>(event: K, listener: Listener<E[K], E, K>, options?: OnOptions): Off {
     this.assertNotDisposed();
@@ -319,14 +298,15 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers a one-time pattern-matching listener.
-   * The listener is removed after its first match.
+   * Registers a one-time pattern-based listener. The handler is called when an
+   * event whose string key matches the pattern is emitted, then automatically
+   * removed.
    *
-   * @param pattern - A string pattern (compiled to DFA) or RegExp to match against event keys.
-   * @param handler - The handler invoked when a matching event is emitted.
-   * @param options - Optional registration configuration. See {@link on} for details.
-   * @returns An `Off` function that removes this pattern handler when called.
-   * @throws If the bus has been disposed.
+   * @param pattern - A RegExp or string pattern to match event keys against.
+   * @param handler - The handler function, receiving the event string, payload,
+   *   regex match groups, and listener context.
+   * @param options - Optional registration configuration.
+   * @returns A function that unregisters the handler when called.
    */
   onceMatch(pattern: RegExp | string, handler: PatternHandler<E>, options?: OnOptions): Off {
     this.assertNotDisposed();
@@ -336,13 +316,14 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers a pattern-matching listener that fires for all matching events.
+   * Registers a pattern-based listener. The handler is called whenever an event
+   * whose string key matches the pattern is emitted.
    *
-   * @param pattern - A string pattern (compiled to DFA) or RegExp to match against event keys.
-   * @param handler - The handler invoked when a matching event is emitted.
-   * @param options - Optional registration configuration. See {@link on} for details.
-   * @returns An `Off` function that removes this pattern handler when called.
-   * @throws If the bus has been disposed.
+   * @param pattern - A RegExp or string pattern to match event keys against.
+   * @param handler - The handler function, receiving the event string, payload,
+   *   regex match groups, and listener context.
+   * @param options - Optional registration configuration.
+   * @returns A function that unregisters the handler when called.
    */
   onMatch(pattern: RegExp | string, handler: PatternHandler<E>, options?: OnOptions): Off {
     this.assertNotDisposed();
@@ -352,16 +333,15 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers a synchronous middleware function.
-   * Middleware execute before listeners and can stop propagation via `ctx.stop()` or `ctx.cancel()`.
+   * Registers synchronous middleware that intercepts events before they reach
+   * listeners.
    *
-   * @param mw - The synchronous middleware function.
+   * @param mw - The middleware function.
    * @param options - Optional middleware configuration.
-   * @param options.pattern - A string pattern to conditionally apply this middleware.
-   * @param options.match - A custom match function to conditionally apply this middleware.
-   * @returns An `Off` function that removes this middleware when called.
-   * @throws If the bus has been disposed.
-   * @throws If the middleware returns a Promise (use `useAsync` instead).
+   * @param options.pattern - Event key pattern to restrict when the middleware runs.
+   * @param options.match - Custom predicate to determine if the middleware runs.
+   * @returns A function that unregisters the middleware when called.
+   * @throws If the middleware returns a Promise. Use {@link useAsync} instead.
    */
   use(mw: MiddlewareSync<E>, options?: UseOptions<E>): Off {
     this.assertNotDisposed();
@@ -381,13 +361,14 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers an asynchronous middleware function.
-   * Async middleware must call `await next()` to continue the chain.
+   * Registers asynchronous middleware that intercepts events before they reach
+   * listeners.
    *
-   * @param mw - The asynchronous middleware function.
-   * @param options - Optional middleware configuration. See {@link use} for details.
-   * @returns An `Off` function that removes this middleware when called.
-   * @throws If the bus has been disposed.
+   * @param mw - The async middleware function.
+   * @param options - Optional middleware configuration.
+   * @param options.pattern - Event key pattern to restrict when the middleware runs.
+   * @param options.match - Custom predicate to determine if the middleware runs.
+   * @returns A function that unregisters the middleware when called.
    */
   useAsync(mw: MiddlewareAsync<E>, options?: UseOptions<E>): Off {
     this.assertNotDisposed();
@@ -400,15 +381,15 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Executes a function within a new scope, automatically cleaning up
-   * any listeners registered during execution.
+   * Executes a function within a temporary {@link EventScope}. All listeners
+   * registered during the function's execution are automatically removed when
+   * the scope is disposed.
    *
    * @typeParam T - The return type of the function.
    * @param fn - The function to execute within the scope.
    * @param options - Optional configuration.
-   * @param options.parent - Optional parent scope. If omitted, the current runtime scope is used.
+   * @param options.parent - Optional parent scope to nest within.
    * @returns A promise resolving to the function's return value.
-   * @throws If the bus has been disposed.
    */
   async withScope<T>(
     fn: (scope: EventScope<E>) => Promise<T> | T,
@@ -425,9 +406,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Asserts that the bus has not been disposed, throwing an error if it has.
-   *
-   * @throws If the bus instance has been disposed.
+   * Throws if the EventBus has been disposed.
+   * @throws If the instance is disposed.
    */
   private assertNotDisposed(): void {
     if (this.disposed) {
@@ -436,11 +416,11 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Binds an `Off` function to the current active scope, if any.
-   * When the scope is disposed, the `Off` function is automatically called.
+   * Binds an unregister function to the current scope, if one exists.
+   * This ensures listeners are cleaned up when the scope is disposed.
    *
-   * @param off - The `Off` function to bind.
-   * @returns The original `Off` function (possibly wrapped by the scope).
+   * @param off - The unregister function.
+   * @returns The same unregister function.
    */
   private bindOffToCurrentScope(off: Off): Off {
     const scope = this.runtime.getScope();
@@ -451,11 +431,11 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Builds a middleware match function from options.
-   * Combines pattern-based DFA matching with a custom match function if both are provided.
+   * Builds a middleware match function from the given options.
+   * Combines pattern-based and custom matching into a single predicate.
    *
-   * @param options - Middleware registration options.
-   * @returns A match function or `undefined` if no filtering is configured.
+   * @param options - The middleware use options.
+   * @returns A match function, or `undefined` if no matching is specified.
    */
   private buildMiddlewareMatch(options?: UseOptions<E>): MiddlewareEntry<E>['match'] {
     const hasPattern = options?.pattern !== undefined;
@@ -475,11 +455,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Creates a compiled pattern listener entry from a pattern and handler.
+   * Builds a compiled pattern listener entry from registration parameters.
+   * Handles both native RegExp and DFA-based string patterns.
    *
-   * @param once - Whether this is a one-time listener.
-   * @param pattern - The string pattern or RegExp to match event keys.
-   * @param handler - The handler function to invoke on match.
+   * @param once - Whether the listener fires only once.
+   * @param pattern - The pattern to match against event keys.
+   * @param handler - The handler function.
    * @param options - Optional registration configuration.
    * @returns A compiled pattern listener entry.
    */
@@ -523,12 +504,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Compares two listener entries for priority ordering.
-   * Higher priority values are ordered first. Equal priorities use sequence ascending.
+   * Compares two listener/middleware entries by priority (descending) and
+   * registration sequence (ascending) for stable insertion ordering.
    *
    * @param a - First entry.
    * @param b - Second entry.
-   * @returns Negative if `a` sorts before `b`, positive if `a` sorts after `b`, zero if equal.
+   * @returns Negative if `a` sorts before `b`, positive if after.
    */
   private compareListenerPriority(
     a: { priority: number; seq: number },
@@ -541,10 +522,11 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Creates a disposable `Off` function that invokes the cleanup function at most once.
+   * Creates a disposable unregister function that invokes the given cleanup
+   * function at most once.
    *
-   * @param cleanupFn - The function to invoke on disposal.
-   * @returns An `Off` function.
+   * @param cleanupFn - The function to call on unregister.
+   * @returns A disposer function.
    */
   private createDisposableOff(cleanupFn: () => void): Off {
     let executed = false;
@@ -558,14 +540,14 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Creates a frozen listener context object with reactive getters for lifecycle state.
+   * Creates a frozen listener context object for the given dispatch phase.
    *
    * @typeParam K - The event key type.
-   * @param baseData - The base context data (event, id, payload, timestamp, origin).
-   * @param isCanceled - Getter function for canceled state.
-   * @param isImmediateStopped - Getter function for immediate stop state.
-   * @param isStopped - Getter function for stopped state.
-   * @param getOrCreateMeta - Lazy initializer for the meta object.
+   * @param baseData - Base event data.
+   * @param isCanceled - Getter for the canceled state.
+   * @param isImmediateStopped - Getter for the immediate-stop state.
+   * @param isStopped - Getter for the stopped state.
+   * @param getOrCreateMeta - Lazy metadata factory.
    * @param phase - The current dispatch phase.
    * @returns A frozen listener context.
    */
@@ -602,14 +584,13 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Creates a lightweight frozen context for replaying sticky events.
-   * Replay contexts always have `id: 0`, `timestamp: 0`, and frozen empty meta.
+   * Creates a listener context for sticky replay dispatching.
    *
    * @typeParam K - The event key type.
    * @param event - The event key.
    * @param payload - The event payload.
-   * @param phase - The dispatch phase ('exact' or 'pattern').
-   * @returns A frozen replay listener context.
+   * @param phase - The dispatch phase.
+   * @returns A frozen replay listener context with zeroed timestamps and ID.
    */
   private createReplayContext<K extends keyof E>(
     event: K,
@@ -631,26 +612,36 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Dispatches exact and pattern listeners after middleware execution completes.
-   * If the middleware context is stopped or canceled, no listeners are invoked.
+   * Dispatches an event to exact and pattern listeners after middleware has
+   * completed.
    *
    * @typeParam K - The event key type.
-   * @param middlewareCtx - The middleware context (checked for stop/cancel state).
-   * @param matchedPatterns - The matched pattern entries for this event.
-   * @param createListenerContext - Factory function to create listener contexts.
+   * @param middlewareCtx - The middleware context (shared state).
+   * @param matchedPatterns - Pre-computed pattern matches.
+   * @param createListenerContext - Factory for listener contexts.
    */
   private dispatchListeners<K extends keyof E>(
     middlewareCtx: MiddlewareContext<E, K>,
-    matchedPatterns: MatchedPattern<E>[],
+    matchedPatterns: VersionedMatchedPatterns<E>,
     createListenerContext: (phase: 'exact' | 'pattern') => ListenerContext<E, K>,
   ): void {
     if (!middlewareCtx.isStopped && !middlewareCtx.isCanceled) {
       this.invokeExactListeners(middlewareCtx.event, middlewareCtx.payload, createListenerContext);
     }
 
-    if (!middlewareCtx.isStopped && !middlewareCtx.isCanceled) {
-      for (const { entry, match } of matchedPatterns) {
-        if (!this.patternListeners.includes(entry)) {
+    if (!middlewareCtx.isStopped && !middlewareCtx.isCanceled && matchedPatterns.length > 0) {
+      let activePatternSet: Set<CompiledPatternListenerEntry<E>> | undefined;
+      let activePatternVersion = matchedPatterns[MATCHED_PATTERN_VERSION];
+
+      for (let i = 0; i < matchedPatterns.length; i++) {
+        const { entry, match } = matchedPatterns[i]!;
+
+        if (activePatternVersion !== this.patternListenerVersion) {
+          activePatternSet = new Set(this.patternListeners);
+          activePatternVersion = this.patternListenerVersion;
+        }
+
+        if (activePatternSet && !activePatternSet.has(entry)) {
           continue;
         }
 
@@ -664,25 +655,27 @@ export class EventBus<E extends EventMap> {
           this.removePatternEntry(entry);
         }
 
-        this.safeCall(() =>
-          entry.handler(middlewareCtx.event as string, middlewareCtx.payload, match, listenerCtx),
+        this.safeCallPatternHandler(
+          entry.handler,
+          middlewareCtx.event as string,
+          middlewareCtx.payload,
+          match,
+          listenerCtx,
         );
       }
     }
   }
 
   /**
-   * Core event emission logic shared by sync and async emit methods.
-   *
-   * Handles sticky event storage, pattern matching, context creation,
-   * and middleware execution.
+   * Core emit logic shared by {@link emit} and {@link emitAsync}.
+   * Handles sticky storage, pattern matching, and middleware execution.
    *
    * @typeParam K - The event key type.
-   * @param event - The event key to emit.
+   * @param event - The event key.
    * @param payload - The event payload.
-   * @param options - Optional emit configuration.
+   * @param options - Emit options.
    * @param allowAsyncMiddleware - Whether async middleware is permitted.
-   * @returns A Promise if async middleware is encountered, otherwise void.
+   * @returns A Promise if async middleware is involved, otherwise void.
    */
   private emitEvent<K extends keyof E>(
     event: K,
@@ -698,8 +691,10 @@ export class EventBus<E extends EventMap> {
       }
     }
 
-    const matchedPatterns: MatchedPattern<E>[] =
-      typeof event === 'string' ? this.matchPatternListeners(event) : [];
+    const matchedPatterns: VersionedMatchedPatterns<E> =
+      typeof event === 'string' && this.patternListeners.length > 0
+        ? this.matchPatternListeners(event)
+        : (NO_PATTERN_MATCHES as VersionedMatchedPatterns<E>);
 
     let stopped = false;
     let immediateStopped = false;
@@ -753,15 +748,36 @@ export class EventBus<E extends EventMap> {
       },
     };
 
-    const createListenerCtx = (phase: 'exact' | 'pattern'): ListenerContext<E, K> =>
-      this.createListenerContext(
+    let exactListenerCtx: ListenerContext<E, K> | undefined;
+    let patternListenerCtx: ListenerContext<E, K> | undefined;
+    const createListenerCtx = (phase: 'exact' | 'pattern'): ListenerContext<E, K> => {
+      if (phase === 'exact') {
+        exactListenerCtx ??= this.createListenerContext(
+          baseData,
+          isCanceled,
+          isImmediateStopped,
+          isStopped,
+          getOrCreateMeta,
+          'exact',
+        );
+        return exactListenerCtx;
+      }
+
+      patternListenerCtx ??= this.createListenerContext(
         baseData,
         isCanceled,
         isImmediateStopped,
         isStopped,
         getOrCreateMeta,
-        phase,
+        'pattern',
       );
+      return patternListenerCtx;
+    };
+
+    if (this.middlewares.length === 0) {
+      this.dispatchListeners(middlewareContext, matchedPatterns, createListenerCtx);
+      return;
+    }
 
     return this.executeMiddlewares(
       middlewareContext,
@@ -772,22 +788,22 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Executes the middleware chain sequentially, then dispatches listeners.
+   * Executes the middleware chain sequentially, then dispatches to listeners.
    *
    * @typeParam K - The event key type.
    * @param middlewareCtx - The middleware context.
-   * @param rawMatches - Matched pattern entries.
+   * @param rawMatches - Pre-computed pattern matches.
    * @param createListenerContext - Factory for listener contexts.
-   * @param allowAsyncMiddleware - Whether async middleware is allowed.
-   * @returns A Promise if async middleware is present, otherwise void.
+   * @param allowAsyncMiddleware - Whether async middleware is permitted.
+   * @returns A Promise if any middleware is async, otherwise void.
    */
   private executeMiddlewares<K extends keyof E>(
     middlewareCtx: MiddlewareContext<E, K>,
-    rawMatches: MatchedPattern<E>[],
+    rawMatches: VersionedMatchedPatterns<E>,
     createListenerContext: (phase: 'exact' | 'pattern') => ListenerContext<E, K>,
     allowAsyncMiddleware: boolean,
   ): Promise<void> | void {
-    const middlewareList = this.middlewares.slice();
+    const middlewareList = this.middlewares;
     let index = 0;
 
     const processNext = (): Promise<void> | void => {
@@ -821,11 +837,11 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Retrieves or compiles a DFA matcher for the given pattern string.
-   * Compiled matchers are cached for reuse.
+   * Retrieves a compiled DFA matcher from cache, or compiles and caches a new
+   * one for the given pattern string.
    *
    * @param pattern - The pattern string to compile.
-   * @returns A compiled DFA Matcher.
+   * @returns A compiled Matcher instance.
    */
   private getOrCompileDfa(pattern: string): Matcher {
     let cached = this.dfaCache.get(pattern);
@@ -837,8 +853,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Handles an error thrown by a listener.
-   * Logs the error if `logErrors` is enabled, and calls `onError` if configured.
+   * Handles errors thrown by listener functions.
+   * Logs and/or forwards to the configured error handler.
    *
    * @param err - The error thrown by the listener.
    */
@@ -858,8 +874,20 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Handles an error thrown by middleware.
-   * Logs the error if `logErrors` is enabled, and calls `onError` if configured.
+   * Checks if a listener returned a Promise, and attaches error handling to it.
+   * This prevents unhandled promise rejections from async listeners.
+   *
+   * @param result - The return value from a listener call.
+   */
+  private handleMaybeAsyncListenerResult(result: unknown): void {
+    if (this.isPromiseLike(result)) {
+      Promise.resolve(result).catch((err) => this.handleListenerError(err));
+    }
+  }
+
+  /**
+   * Handles errors thrown by middleware functions.
+   * Logs and/or forwards to the configured error handler.
    *
    * @param err - The error thrown by the middleware.
    */
@@ -877,7 +905,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Inserts an exact listener entry into the appropriate priority-sorted bucket.
+   * Inserts an exact listener entry into the appropriate bucket, maintaining
+   * priority and sequence ordering via a copy-on-write strategy.
    *
    * @typeParam K - The event key type.
    * @param event - The event key.
@@ -887,20 +916,16 @@ export class EventBus<E extends EventMap> {
     event: K,
     entry: StoredExactListenerEntry<E>,
   ): void {
-    let entries = this.exactListeners.get(event);
-    if (!entries) {
-      entries = [];
-      this.exactListeners.set(event, entries);
-    }
-    this.insertSortedByPriority(entries, entry);
+    const entries = this.exactListeners.get(event);
+    const nextEntries = entries ? this.insertSortedByPriorityCopy(entries, entry) : [entry];
+    this.exactListeners.set(event, nextEntries);
   }
 
   /**
-   * Inserts an entry into a sorted array using binary search based on priority and sequence.
-   * Higher priority inserts earlier. Equal priority orders by sequence ascending.
+   * Inserts an entry into an array in place, maintaining priority (descending)
+   * and sequence (ascending) order using binary search.
    *
-   * @typeParam T - The entry type (must have `priority` and `seq` properties).
-   * @param bucket - The sorted array to insert into.
+   * @param bucket - The array to insert into.
    * @param entry - The entry to insert.
    */
   private insertSortedByPriority<T extends { priority: number; seq: number }>(
@@ -921,12 +946,30 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Invokes all exact listeners for the given event key.
+   * Returns a new array with the entry inserted in sorted order. Used for
+   * copy-on-write immutability during dispatch.
+   *
+   * @param bucket - The source array.
+   * @param entry - The entry to insert.
+   * @returns A new sorted array.
+   */
+  private insertSortedByPriorityCopy<T extends { priority: number; seq: number }>(
+    bucket: T[],
+    entry: T,
+  ): T[] {
+    const nextBucket = bucket.slice();
+    this.insertSortedByPriority(nextBucket, entry);
+    return nextBucket;
+  }
+
+  /**
+   * Invokes all exact listeners registered for the given event key.
+   * Respects stop/immediate-stop/cancel signals.
    *
    * @typeParam K - The event key type.
    * @param event - The event key.
    * @param payload - The event payload.
-   * @param createListenerContext - Factory to create listener contexts.
+   * @param createListenerContext - Factory for listener contexts.
    */
   private invokeExactListeners<K extends keyof E>(
     event: K,
@@ -938,26 +981,26 @@ export class EventBus<E extends EventMap> {
       return;
     }
 
-    for (const { listener } of entries.slice()) {
+    for (let i = 0; i < entries.length; i++) {
+      const { listener } = entries[i]!;
       const listenerCtx = createListenerContext('exact');
 
       if (listenerCtx.isImmediateStopped || listenerCtx.isStopped || listenerCtx.isCanceled) {
         return;
       }
 
-      this.safeCall(() => (listener as Listener<E[K], E, K>)(payload, listenerCtx));
+      this.safeCallListener(listener as Listener<E[K], E, K>, payload, listenerCtx);
     }
   }
 
   /**
-   * Invokes a single middleware entry, handling both sync and async middleware,
-   * and enforcing that `next()` is called exactly once.
+   * Invokes a single middleware entry, managing the `next()` callback semantics
+   * and enforcing that `next()` is called exactly once when required.
    *
    * @param entry - The middleware entry to invoke.
    * @param ctx - The middleware context.
-   * @param next - The callback to continue to the next middleware or dispatch.
-   * @returns A Promise if async, otherwise void.
-   * @throws If `next()` is not called or is called multiple times.
+   * @param next - The callback to proceed to the next middleware.
+   * @returns A Promise if the middleware or its next callback is async.
    */
   private invokeMiddleware(
     entry: MiddlewareEntry<E>,
@@ -1015,9 +1058,8 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Type guard checking whether a value is Promise-like (has a `.then` method).
+   * Type guard that checks if a value is Promise-like (has a `.then` method).
    *
-   * @typeParam T - The resolved type of the potential promise.
    * @param value - The value to check.
    * @returns `true` if the value is Promise-like, `false` otherwise.
    */
@@ -1030,19 +1072,27 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Matches an event string against all registered pattern listeners.
+   * Matches an event string against all registered pattern listeners and
+   * returns the matching entries.
    *
    * @param event - The event string to match.
-   * @returns An array of matched pattern entries with their match params.
+   * @returns A versioned array of matched pattern entries.
    */
-  private matchPatternListeners(event: string): MatchedPattern<E>[] {
-    const matches: MatchedPattern<E>[] = [];
-    for (const entry of this.patternListeners) {
+  private matchPatternListeners(event: string): VersionedMatchedPatterns<E> {
+    const patternListeners = this.patternListeners;
+    if (patternListeners.length === 0) {
+      return NO_PATTERN_MATCHES as VersionedMatchedPatterns<E>;
+    }
+
+    const matches = [] as VersionedMatchedPatterns<E>;
+    for (let i = 0; i < patternListeners.length; i++) {
+      const entry = patternListeners[i]!;
       const params = entry.match(event);
       if (params) {
         matches.push({ entry, match: params });
       }
     }
+    matches[MATCHED_PATTERN_VERSION] = this.patternListenerVersion;
     return matches;
   }
 
@@ -1050,19 +1100,19 @@ export class EventBus<E extends EventMap> {
    * Normalizes a limit value to a non-negative finite integer.
    *
    * @param value - The raw limit value.
-   * @returns A normalized non-negative integer.
+   * @returns A non-negative integer.
    */
   private normalizeLimit(value: number): number {
     return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
   }
 
   /**
-   * Stores a sticky event for pattern replay.
-   * Respects `stickyMax` and `stickyPatternMaxPerKey` limits by trimming oldest entries.
+   * Pushes a sticky event for pattern-based replay, respecting configured
+   * capacity limits.
    *
-   * @param eventKey - The event string key.
+   * @param eventKey - The event key string.
    * @param payload - The event payload.
-   * @param mode - The sticky mode ('replay' or 'consume').
+   * @param mode - The sticky mode (replay or consume).
    */
   private pushStickyEvent(eventKey: string, payload: unknown, mode: StickyMode): void {
     if (this.stickyMax <= 0 || this.stickyPatternMaxPerKey <= 0) {
@@ -1091,13 +1141,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Stores a sticky event for exact listener replay.
-   * Respects `stickyExactMax` limit by trimming oldest entries.
+   * Pushes a sticky event for exact-key replay, respecting the per-key limit.
    *
    * @typeParam K - The event key type.
-   * @param event - The exact event key.
+   * @param event - The event key.
    * @param payload - The event payload.
-   * @param mode - The sticky mode ('replay' or 'consume').
+   * @param mode - The sticky mode (replay or consume).
    */
   private pushStickyExact<K extends keyof E>(event: K, payload: unknown, mode: StickyMode): void {
     if (this.stickyExactMax <= 0) {
@@ -1115,14 +1164,15 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers an exact listener, handling sticky replay and priority ordering.
+   * Registers an exact listener, handles sticky replay for the event, and
+   * returns an unregister function.
    *
    * @typeParam K - The event key type.
-   * @param once - Whether this is a one-time listener.
+   * @param once - Whether the listener is one-time.
    * @param event - The event key.
    * @param listener - The listener function.
    * @param options - Optional registration configuration.
-   * @returns An `Off` function to remove this listener.
+   * @returns An unregister function.
    */
   private registerExactListener<K extends keyof E>(
     once: boolean,
@@ -1156,13 +1206,13 @@ export class EventBus<E extends EventMap> {
       if (replay.found) {
         const replayPayload = replay.payload as E[K];
         const replayCtx = this.createReplayContext(event, replayPayload, 'exact');
-        this.safeCall(() => registeredListener(replayPayload, replayCtx));
+        this.safeCallListener(registeredListener, replayPayload, replayCtx);
       }
     } else {
       for (const replayPayload of this.replayExactStickyAll(event, consumeStickyOverride)) {
         const payloadForEvent = replayPayload as E[K];
         const replayCtx = this.createReplayContext(event, payloadForEvent, 'exact');
-        this.safeCall(() => registeredListener(payloadForEvent, replayCtx));
+        this.safeCallListener(registeredListener, payloadForEvent, replayCtx);
       }
     }
 
@@ -1172,30 +1222,33 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Registers a middleware entry and returns an `Off` function for removal.
+   * Registers a middleware entry and returns an unregister function.
    *
    * @param entry - The middleware entry to register.
-   * @returns An `Off` function to remove this middleware.
+   * @returns An unregister function.
    */
   private registerMiddlewareEntry(entry: MiddlewareEntry<E>): Off {
-    this.middlewares.push(entry);
+    this.middlewares = this.middlewares.concat(entry);
     return this.createDisposableOff(() => {
-      const idx = this.middlewares.indexOf(entry);
+      const middlewares = this.middlewares;
+      const idx = middlewares.indexOf(entry);
       if (idx !== -1) {
-        this.middlewares.splice(idx, 1);
+        const nextMiddlewares = middlewares.slice();
+        nextMiddlewares.splice(idx, 1);
+        this.middlewares = nextMiddlewares;
       }
     });
   }
 
   /**
-   * Registers a pattern listener, inserting it into the priority-sorted list
-   * and replaying any matching sticky events.
+   * Registers a pattern listener, handles sticky replay, and returns an
+   * unregister function.
    *
-   * @param once - Whether this is a one-time listener.
-   * @param pattern - The string pattern or RegExp.
+   * @param once - Whether the listener is one-time.
+   * @param pattern - The pattern to match event keys against.
    * @param handler - The pattern handler function.
    * @param options - Optional registration configuration.
-   * @returns An `Off` function to remove this pattern listener.
+   * @returns An unregister function.
    */
   private registerPatternListener(
     once: boolean,
@@ -1204,7 +1257,8 @@ export class EventBus<E extends EventMap> {
     options?: OnOptions,
   ): Off {
     const entry = this.buildPatternEntry(once, pattern, handler, options);
-    this.insertSortedByPriority(this.patternListeners, entry);
+    this.patternListeners = this.insertSortedByPriorityCopy(this.patternListeners, entry);
+    this.patternListenerVersion++;
     this.replayStickyForEntry(entry, options?.consumeSticky);
     if (once && !this.patternListeners.includes(entry)) {
       return this.createDisposableOff(() => {});
@@ -1213,11 +1267,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Removes an exact listener matching the given listener function reference.
+   * Removes an exact listener by reference.
+   * Matches both the active wrapper and the original listener function.
    *
    * @typeParam K - The event key type.
    * @param event - The event key.
-   * @param listener - The listener function reference to remove.
+   * @param listener - The listener function to remove.
    */
   private removeExactListener<K extends keyof E>(event: K, listener: Listener<any, E, any>): void {
     const entries = this.exactListeners.get(event);
@@ -1232,30 +1287,39 @@ export class EventBus<E extends EventMap> {
       return;
     }
 
-    entries.splice(index, 1);
-
-    if (entries.length === 0) {
+    if (entries.length === 1) {
       this.exactListeners.delete(event);
+      return;
     }
+
+    const nextEntries = entries.slice();
+    nextEntries.splice(index, 1);
+    this.exactListeners.set(event, nextEntries);
   }
 
   /**
-   * Removes a compiled pattern listener entry from the registration list.
+   * Removes a pattern listener entry and bumps the pattern version for
+   * invalidation.
    *
    * @param entry - The pattern listener entry to remove.
    */
   private removePatternEntry(entry: CompiledPatternListenerEntry<E>): void {
-    const idx = this.patternListeners.indexOf(entry);
+    const patternListeners = this.patternListeners;
+    const idx = patternListeners.indexOf(entry);
     if (idx !== -1) {
-      this.patternListeners.splice(idx, 1);
+      const nextPatternListeners = patternListeners.slice();
+      nextPatternListeners.splice(idx, 1);
+      this.patternListeners = nextPatternListeners;
+      this.patternListenerVersion++;
     }
   }
 
   /**
-   * Deletes a sticky event key from the map if its value array is empty.
+   * Removes a sticky event key from the pattern replay map if its batch is
+   * empty.
    *
-   * @param eventKey - The event key to check and possibly delete.
-   * @param stickyBatch - Optional pre-fetched batch array.
+   * @param eventKey - The event key string.
+   * @param stickyBatch - Optional pre-fetched batch to check.
    */
   private removeStickyEventKeyIfEmpty(eventKey: string, stickyBatch?: StickyEvent[]): void {
     const batch = stickyBatch ?? this.stickyEvents.get(eventKey);
@@ -1265,13 +1329,13 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Replays all sticky events for an exact event key, consuming or preserving
-   * based on the sticky mode.
+   * Replays all sticky events for an exact key, returning their payloads and
+   * optionally consuming them based on mode and override.
    *
    * @typeParam K - The event key type.
    * @param event - The event key.
-   * @param consumeOverride - Override for consumption behavior.
-   * @returns An array of replay payloads.
+   * @param consumeOverride - Override for sticky consumption behavior.
+   * @returns An array of payloads.
    */
   private replayExactStickyAll<K extends keyof E>(
     event: K,
@@ -1302,11 +1366,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Replays the first sticky event for an exact key (used by once listeners).
+   * Replays the first sticky event for an exact key (for once() listeners),
+   * returning its payload and optionally consuming it.
    *
    * @typeParam K - The event key type.
    * @param event - The event key.
-   * @param consumeOverride - Override for consumption behavior.
+   * @param consumeOverride - Override for sticky consumption behavior.
    * @returns A replay result with the payload if found.
    */
   private replayExactStickyOne<K extends keyof E>(
@@ -1330,10 +1395,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Replays matching sticky events for a newly registered pattern listener.
+   * Replays sticky events for a newly registered pattern listener entry.
+   * Iterates over all stored sticky event keys, matches them against the pattern,
+   * and invokes the handler for each matching event.
    *
-   * @param entry - The compiled pattern listener entry.
-   * @param consumeOverride - Override for consumption behavior.
+   * @param entry - The pattern listener entry.
+   * @param consumeOverride - Override for sticky consumption behavior.
    */
   private replayStickyForEntry(
     entry: CompiledPatternListenerEntry<E>,
@@ -1359,7 +1426,7 @@ export class EventBus<E extends EventMap> {
           'pattern',
         ) as ListenerContext<E>;
 
-        this.safeCall(() => entry.handler(eventKey, stickyItem.payload as any, match, replayCtx));
+        this.safeCallPatternHandler(entry.handler, eventKey, stickyItem.payload, match, replayCtx);
 
         if (this.shouldConsumeSticky(consumeOverride, stickyItem.mode)) {
           stickyBatch.splice(i, 1);
@@ -1378,25 +1445,54 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Safely invokes a function, catching synchronous errors and handling
-   * rejected promises from async listener return values.
+   * Safely invokes a listener, catching synchronous errors and attaching error
+   * handling to returned Promises.
    *
-   * @param fn - The function to invoke safely.
+   * @typeParam K - The event key type.
+   * @param listener - The listener function.
+   * @param payload - The event payload.
+   * @param ctx - The listener context.
    */
-  private safeCall(fn: () => unknown): void {
+  private safeCallListener<K extends keyof E>(
+    listener: Listener<E[K], E, K>,
+    payload: E[K],
+    ctx: ListenerContext<E, K>,
+  ): void {
     try {
-      const result = fn();
-      if (this.isPromiseLike(result)) {
-        Promise.resolve(result).catch((err) => this.handleListenerError(err));
-      }
+      this.handleMaybeAsyncListenerResult(listener(payload, ctx));
     } catch (err) {
       this.handleListenerError(err);
     }
   }
 
   /**
-   * Schedules an error to be thrown asynchronously using the best available mechanism.
-   * Tries `queueMicrotask`, falls back to `Promise.resolve().then()`, then `setTimeout`.
+   * Safely invokes a pattern handler, catching synchronous errors and attaching
+   * error handling to returned Promises.
+   *
+   * @param handler - The pattern handler function.
+   * @param event - The matched event string.
+   * @param payload - The event payload.
+   * @param match - The regex match result or empty object.
+   * @param ctx - The listener context.
+   */
+  private safeCallPatternHandler(
+    handler: PatternHandler<E>,
+    event: string,
+    payload: unknown,
+    match: unknown,
+    ctx: ListenerContext<E>,
+  ): void {
+    try {
+      this.handleMaybeAsyncListenerResult(handler(event, payload as any, match as any, ctx));
+    } catch (err) {
+      this.handleListenerError(err);
+    }
+  }
+
+  /**
+   * Schedules an error to be thrown asynchronously to avoid disrupting the
+   * current synchronous dispatch. Uses `queueMicrotask` when available,
+   * falling back to `Promise.resolve().then()`, and finally `setTimeout`.
    *
    * @param err - The error to throw asynchronously.
    */
@@ -1419,11 +1515,12 @@ export class EventBus<E extends EventMap> {
   }
 
   /**
-   * Determines whether a sticky event should be consumed based on mode and override.
+   * Determines whether a sticky event should be consumed based on its mode
+   * and an optional override flag.
    *
-   * @param override - Optional explicit override for consumption.
+   * @param override - Explicit consumption flag, or `undefined` to use mode-based logic.
    * @param mode - The sticky event's mode.
-   * @returns `true` if the event should be consumed.
+   * @returns `true` if the event should be consumed, `false` if it should be replayed.
    */
   private shouldConsumeSticky(override: boolean | undefined, mode: StickyMode): boolean {
     return override ?? mode === 'consume';
