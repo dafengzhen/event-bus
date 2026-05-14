@@ -1,4 +1,8 @@
-import { clearCompileCache, compile, type Matcher } from '@dafengzhen/regex-derivative';
+import {
+  clearPatternMatcherCache,
+  createPatternMatcher,
+  type PatternMatcher,
+} from '@dafengzhen/derivative-matcher';
 
 import type {
   CompiledPatternListenerEntry,
@@ -91,7 +95,7 @@ export class EventBus<E extends EventMap> {
   private readonly clearGlobalCacheOnDispose: boolean;
 
   /** Internal cache of compiled DFA matchers keyed by pattern string. */
-  private readonly dfaCache = new Map<string, Matcher>();
+  private readonly dfaCache = new Map<string, PatternMatcher>();
 
   /** Whether the EventBus has been disposed and should no longer be used. */
   private disposed = false;
@@ -206,7 +210,7 @@ export class EventBus<E extends EventMap> {
     this.clearAll();
     this.dfaCache.clear();
     if (this.clearGlobalCacheOnDispose) {
-      clearCompileCache();
+      clearPatternMatcherCache();
     }
     this.disposed = true;
   }
@@ -447,7 +451,7 @@ export class EventBus<E extends EventMap> {
     const dfa = hasPattern ? this.getOrCompileDfa(options.pattern as string) : undefined;
 
     return (ctx: MiddlewareContext<E>) => {
-      if (dfa && (typeof ctx.event !== 'string' || !dfa.match(ctx.event))) {
+      if (dfa && (typeof ctx.event !== 'string' || !dfa.test(ctx.event))) {
         return false;
       }
       return customMatch ? customMatch(ctx) : true;
@@ -475,7 +479,7 @@ export class EventBus<E extends EventMap> {
       return {
         handler,
         isNativeRegExp: false,
-        match: (event: string) => (dfa.match(event) ? {} : null),
+        match: (event: string) => (dfa.test(event) ? {} : null),
         once,
         pattern,
         priority: options?.priority ?? 80,
@@ -843,10 +847,10 @@ export class EventBus<E extends EventMap> {
    * @param pattern - The pattern string to compile.
    * @returns A compiled Matcher instance.
    */
-  private getOrCompileDfa(pattern: string): Matcher {
+  private getOrCompileDfa(pattern: string): PatternMatcher {
     let cached = this.dfaCache.get(pattern);
     if (!cached) {
-      cached = compile(pattern);
+      cached = createPatternMatcher(pattern);
       this.dfaCache.set(pattern, cached);
     }
     return cached;
