@@ -521,12 +521,12 @@ export type StickyMode = 'consume' | 'replay';
  *
  * @typeParam E - The event map type.
  */
-export type StoredExactListenerEntry<E extends EventMap> = ExactListenerEntry<E, any> & {
+export type StoredExactListenerEntry<E extends EventMap> = {
   /**
    * The original (unwrapped) listener function used for identity checks during removal.
    */
   readonly originalListener: Listener<any, E, any>;
-};
+} & ExactListenerEntry<E, any>;
 
 /**
  * Options for registering middleware.

@@ -45,9 +45,9 @@ const MATCHED_PATTERN_VERSION = Symbol('EventBus.matchedPatternVersion');
  * Extended array type that carries a version stamp used to detect stale
  * pattern listener snapshots during dispatch.
  */
-type VersionedMatchedPatterns<E extends EventMap> = MatchedPattern<E>[] & {
+type VersionedMatchedPatterns<E extends EventMap> = {
   [MATCHED_PATTERN_VERSION]?: number;
-};
+} & MatchedPattern<E>[];
 
 /**
  * A type-safe, high-performance event bus with support for exact and
