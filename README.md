@@ -1,4 +1,4 @@
-## @dafengzhen/event-bus
+# event-bus
 
 [![GitHub License](https://img.shields.io/github/license/dafengzhen/event-bus?color=blue)](https://github.com/dafengzhen/event-bus)
 [![npm version](https://img.shields.io/npm/v/@dafengzhen/event-bus)](https://www.npmjs.com/package/@dafengzhen/event-bus)
