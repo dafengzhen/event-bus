@@ -1,5 +1,5 @@
-import type { EventScope } from './event-scope.ts';
-import type { EventMap, MaybePromise, ScopeFrame, ScopeStorage } from './types.ts';
+import type { EventScope } from './event-scope.js';
+import type { EventMap, MaybePromise, ScopeFrame, ScopeStorage } from './types.js';
 
 /**
  * Manages the execution context stack for EventScope instances.

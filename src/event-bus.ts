@@ -24,10 +24,10 @@ import type {
   StickyMode,
   StoredExactListenerEntry,
   UseOptions,
-} from './types.ts';
+} from './types.js';
 
-import { DispatcherRuntime } from './dispatcher-runtime.ts';
-import { EventScope } from './event-scope.ts';
+import { DispatcherRuntime } from './dispatcher-runtime.js';
+import { EventScope } from './event-scope.js';
 
 /** Default replay result indicating no sticky event was found. */
 const NO_REPLAY: ReplayOneResult = { found: false };

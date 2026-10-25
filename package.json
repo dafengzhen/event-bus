@@ -1,6 +1,6 @@
 {
   "name": "@dafengzhen/event-bus",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "A lightweight TypeScript event bus with strong typing, middleware pipeline, and pattern-based event listeners.",
   "keywords": [
     "event-bus",
@@ -27,145 +27,92 @@
     "dist"
   ],
   "type": "module",
-  "main": "./dist/cjs/modern/index.js",
+  "sideEffects": false,
+  "main": "./dist/cjs/modern/index.cjs",
   "module": "./dist/esm/modern/index.js",
   "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/types/index.d.ts",
-      "import": "./dist/esm/modern/index.js",
-      "require": "./dist/cjs/modern/index.js",
+      "import": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/esm/modern/index.js"
+      },
+      "require": {
+        "types": "./dist/types/index.d.cts",
+        "default": "./dist/cjs/modern/index.cjs"
+      },
       "default": "./dist/esm/modern/index.js"
-    }
+    },
+    "./legacy": {
+      "import": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/esm/legacy/index.js"
+      },
+      "require": {
+        "types": "./dist/types/index.d.cts",
+        "default": "./dist/cjs/legacy/index.cjs"
+      },
+      "default": "./dist/esm/legacy/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org",
+    "tag": "latest"
   },
   "scripts": {
-    "build:types": "tsc -p tsconfig.types.json",
-    "build:modern": "parcel build src/index.ts --target modern-esm --target modern-cjs",
-    "build:legacy": "parcel build src/index.ts --target legacy-esm --target legacy-cjs",
-    "build:dev": "parcel build src/index.ts --target modern-esm-dev --target modern-cjs-dev --target legacy-esm-dev --target legacy-cjs-dev",
-    "build": "npm run build:types && npm run build:modern && npm run build:legacy && npm run build:dev",
-    "prepare": "husky install",
-    "test": "jest",
-    "watch": "parcel watch",
-    "fmt": "oxfmt",
+    "dev": "vite",
+    "build:example": "vite build",
+    "preview": "vite preview",
+    "build": "run-s clean build:bundle build:types",
+    "build:bundle": "node scripts/build.mjs",
+    "build:types": "node scripts/build-types.mjs",
+    "build:modern": "node scripts/build.mjs --group modern",
+    "build:legacy": "node scripts/build.mjs --group legacy",
+    "build:dev": "node scripts/build.mjs --group dev",
+    "clean": "node scripts/clean.mjs",
+    "watch": "node scripts/build.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
     "lint": "oxlint --fix",
-    "lint:fmt": "run-s lint fmt"
+    "lint:check": "oxlint",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "lint:fmt": "run-s lint fmt",
+    "check:package": "publint",
+    "check": "run-s typecheck lint:check fmt:check test build check:package",
+    "commit": "commit",
+    "prepare": "husky",
+    "prepublishOnly": "run-s check"
   },
   "dependencies": {
-    "@dafengzhen/derivative-matcher": "^0.1.2",
-    "@swc/helpers": "^0.5.23",
-    "browserslist-config-baseline": "^0.5.0"
+    "@dafengzhen/derivative-matcher": "^0.1.3"
   },
   "devDependencies": {
-    "@babel/core": "^8.0.1",
-    "@babel/preset-env": "^8.0.2",
-    "@babel/preset-typescript": "^8.0.1",
-    "@commitlint/cli": "^21.2.1",
-    "@commitlint/config-conventional": "^21.2.0",
-    "@commitlint/prompt-cli": "^21.2.0",
-    "@jest/globals": "^30.4.1",
-    "@parcel/packager-ts": "^2.16.4",
-    "@parcel/transformer-typescript-types": "^2.16.4",
-    "@types/node": "^26.1.2",
-    "babel-jest": "^30.4.1",
-    "eslint-plugin-perfectionist": "^5.10.0",
+    "@commitlint/cli": "^21.2.4",
+    "@commitlint/config-conventional": "^21.2.4",
+    "@commitlint/prompt-cli": "^21.2.4",
+    "@types/node": "^26.6.5",
+    "@vitest/coverage-v8": "^5.0.5",
+    "eslint-plugin-perfectionist": "^5.13.0",
     "husky": "^9.1.7",
-    "jest": "^30.4.2",
-    "jest-environment-jsdom": "^30.4.1",
-    "npm-run-all2": "^9.0.3",
-    "oxfmt": "^0.61.0",
-    "oxlint": "^1.76.0",
-    "parcel": "^2.16.4",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "lint-staged": "^17.6.0",
+    "npm-run-all2": "^9.0.4",
+    "oxfmt": "^0.74.0",
+    "oxlint": "^1.89.0",
+    "publint": "^0.3.25",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
   },
   "lint-staged": {
-    "*.{js,jsx,ts,tsx,mjs,cjs}": "npm run lint",
-    "*": "npm run fmt --no-error-on-unmatched-pattern"
+    "*.{cjs,js,jsx,mjs,ts,tsx}": "oxlint --fix",
+    "*": "oxfmt --no-error-on-unmatched-pattern"
   },
-  "allowScripts": {
-    "lmdb@2.8.5": true,
-    "@parcel/watcher@2.6.0": true,
-    "@swc/core@1.15.47": true,
-    "unrs-resolver@1.12.2": true,
-    "msgpackr-extract@3.0.4": true
-  },
-  "targets": {
-    "legacy-cjs": {
-      "distDir": "./dist/cjs/legacy",
-      "engines": {
-        "browsers": ">0.3%, Chrome >= 87, ChromeAndroid >= 87, Edge >= 87, Firefox >= 83, FirefoxAndroid >= 83, Safari >= 14, iOS >= 14"
-      },
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": true,
-      "outputFormat": "commonjs",
-      "sourceMap": true
-    },
-    "legacy-cjs-dev": {
-      "distDir": "./dist/cjs/legacy-dev",
-      "engines": {
-        "browsers": ">0.3%, Chrome >= 87, ChromeAndroid >= 87, Edge >= 87, Firefox >= 83, FirefoxAndroid >= 83, Safari >= 14, iOS >= 14"
-      },
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": false,
-      "outputFormat": "commonjs",
-      "sourceMap": true
-    },
-    "legacy-esm": {
-      "distDir": "./dist/esm/legacy",
-      "engines": {
-        "browsers": ">0.3%, Chrome >= 87, ChromeAndroid >= 87, Edge >= 87, Firefox >= 83, FirefoxAndroid >= 83, Safari >= 14, iOS >= 14"
-      },
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": true,
-      "outputFormat": "esmodule",
-      "sourceMap": true
-    },
-    "legacy-esm-dev": {
-      "distDir": "./dist/esm/legacy-dev",
-      "engines": {
-        "browsers": ">0.3%, Chrome >= 87, ChromeAndroid >= 87, Edge >= 87, Firefox >= 83, FirefoxAndroid >= 83, Safari >= 14, iOS >= 14"
-      },
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": false,
-      "outputFormat": "esmodule",
-      "sourceMap": true
-    },
-    "modern-cjs": {
-      "distDir": "./dist/cjs/modern",
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": true,
-      "outputFormat": "commonjs",
-      "sourceMap": true
-    },
-    "modern-cjs-dev": {
-      "distDir": "./dist/cjs/modern-dev",
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": false,
-      "outputFormat": "commonjs",
-      "sourceMap": true
-    },
-    "modern-esm": {
-      "distDir": "./dist/esm/modern",
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": true,
-      "outputFormat": "esmodule",
-      "sourceMap": true
-    },
-    "modern-esm-dev": {
-      "distDir": "./dist/esm/modern-dev",
-      "includeNodeModules": true,
-      "isLibrary": true,
-      "optimize": false,
-      "outputFormat": "esmodule",
-      "sourceMap": true
-    }
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
   }
 }

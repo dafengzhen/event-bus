@@ -1,4 +1,4 @@
-import type { EventBus } from './event-bus.ts';
+import type { EventBus } from './event-bus.js';
 import type {
   EmitOptions,
   EventMap,
@@ -10,7 +10,7 @@ import type {
   OnOptions,
   PatternHandler,
   UseOptions,
-} from './types.ts';
+} from './types.js';
 
 /**
  * Global counter for generating unique scope IDs.

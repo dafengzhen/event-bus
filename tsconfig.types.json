@@ -1,13 +1,18 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": false,
     "declaration": true,
-    "emitDeclarationOnly": true,
     "declarationMap": false,
-    "stripInternal": true,
+    "emitDeclarationOnly": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": false,
+    "noEmitOnError": true,
     "outDir": "./dist/types",
-    "rootDir": "./src"
+    "rootDir": "./src",
+    "stripInternal": true,
+    "types": []
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }

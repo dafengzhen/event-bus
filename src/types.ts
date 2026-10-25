@@ -1,5 +1,5 @@
-import type { DispatcherRuntime } from './dispatcher-runtime.ts';
-import type { EventScope } from './event-scope.ts';
+import type { DispatcherRuntime } from './dispatcher-runtime.js';
+import type { EventScope } from './event-scope.js';
 
 /**
  * Base context interface shared across all dispatch phases.
