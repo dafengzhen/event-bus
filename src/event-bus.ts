@@ -940,7 +940,7 @@ export class EventBus<E extends EventMap> {
     let hi = bucket.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.compareListenerPriority(entry, bucket[mid]) < 0) {
+      if (this.compareListenerPriority(entry, bucket[mid]!) < 0) {
         hi = mid;
       } else {
         lo = mid + 1;

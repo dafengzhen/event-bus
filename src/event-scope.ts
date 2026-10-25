@@ -53,6 +53,8 @@ export class EventScope<E extends EventMap> {
    */
   readonly id = ++SCOPE_ID;
 
+  readonly parent?: EventScope<E>;
+
   /**
    * Whether this scope has been disposed. Once disposed, the scope
    * cannot be used for new registrations or emissions.
@@ -60,6 +62,8 @@ export class EventScope<E extends EventMap> {
   get isDisposed(): boolean {
     return this.disposed;
   }
+
+  private readonly bus: EventBus<E>;
 
   /**
    * Set of child scopes created from this scope.
@@ -84,10 +88,9 @@ export class EventScope<E extends EventMap> {
    * @param parent - Optional parent scope. If provided, this scope is added as a child.
    * @throws If the parent scope has been disposed.
    */
-  constructor(
-    private readonly bus: EventBus<E>,
-    readonly parent?: EventScope<E>,
-  ) {
+  constructor(bus: EventBus<E>, parent?: EventScope<E>) {
+    this.bus = bus;
+    this.parent = parent;
     parent?.assertAlive();
     parent?.addChild(this);
   }

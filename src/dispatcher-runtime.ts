@@ -37,12 +37,16 @@ export class DispatcherRuntime<E extends EventMap> {
    */
   private readonly scopeStack: Array<ScopeFrame<E>> = [];
 
+  private readonly storage?: ScopeStorage<E> | undefined;
+
   /**
    * Creates a new DispatcherRuntime.
    *
    * @param storage - Optional external scope storage for async context propagation.
    */
-  constructor(private readonly storage?: ScopeStorage<E> | undefined) {}
+  constructor(storage?: ScopeStorage<E> | undefined) {
+    this.storage = storage;
+  }
 
   /**
    * Returns the currently active EventScope, or `undefined` if none is active.
