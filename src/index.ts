@@ -1,4 +1,22 @@
-export * from './dispatcher-runtime.js';
-export * from './event-bus.js';
-export * from './event-scope.js';
-export type * from './types.js';
+export { createEventBus, EventBus } from './event-bus.js';
+export { EventScope } from './event-scope.js';
+export type {
+  AsyncMiddleware,
+  DispatchFailure,
+  DispatchResult,
+  EmitArgs,
+  EmitOptions,
+  EventBusOptions,
+  EventContext,
+  EventDetails,
+  EventMap,
+  EventPattern,
+  Listener,
+  MaybePromise,
+  Middleware,
+  MiddlewareOptions,
+  Observer,
+  SubscriptionOptions,
+  Unsubscribe,
+  WaitForOptions,
+} from './types.js';

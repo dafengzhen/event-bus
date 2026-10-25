@@ -3,12 +3,39 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Library playground</title>
+    <title>Event bus playground</title>
+    <style>
+      body {
+        max-width: 760px;
+        margin: 64px auto;
+        padding: 0 24px;
+        font-family: system-ui, sans-serif;
+        color: #17213a;
+        background: #f5f7fb;
+      }
+      button {
+        padding: 10px 16px;
+        margin: 0 8px 12px 0;
+        cursor: pointer;
+      }
+      pre {
+        min-height: 240px;
+        padding: 24px;
+        border: 1px solid #dce1eb;
+        background: white;
+        white-space: pre-wrap;
+        line-height: 1.7;
+      }
+    </style>
   </head>
   <body>
     <main>
-      <h1>Library playground</h1>
-      <p id="output"></p>
+      <h1>Event bus playground</h1>
+      <p>Typed events, ordered pattern observers, retained events, and explicit scope cleanup.</p>
+      <button id="login">Log in</button>
+      <button id="logout">Log out</button>
+      <button id="dispose">Dispose scope</button>
+      <pre id="output" aria-live="polite"></pre>
     </main>
     <script type="module" src="./main.ts"></script>
   </body>

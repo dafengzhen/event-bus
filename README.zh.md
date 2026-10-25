@@ -1,245 +1,218 @@
 # event-bus
 
-[![GitHub License](https://img.shields.io/github/license/dafengzhen/event-bus?color=blue)](https://github.com/dafengzhen/event-bus)
-[![npm version](https://img.shields.io/npm/v/@dafengzhen/event-bus)](https://www.npmjs.com/package/@dafengzhen/event-bus)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dafengzhen/event-bus/pulls)
-
 [English](./README.md)
 
-一个轻量级、完全类型化的 TypeScript 事件总线，支持中间件管道、基于模式的事件监听、粘性事件以及作用域生命周期管理。
-
-## 特性
-
-- **强类型** — 事件键、负载和监听器上下文均具有完整的类型安全
-- **中间件管道** — 支持同步和异步中间件，提供 `stop()`、`cancel()`、`stopImmediate()` 流程控制
-- **模式匹配** — 支持基于正则表达式或字符串模式（DFA 编译，高性能）的监听器注册
-- **粘性事件** — 在事件触发后注册的监听器也能接收到该事件
-- **事件作用域** — 通过生命周期作用域容器自动清理监听器和中间件
-- **优先级排序** — 通过优先级值控制监听器执行顺序
-- **错误处理** — 可配置的错误日志和自定义错误处理器
-
-## 安装
+强类型 TypeScript 事件总线，提供显式作用域、模式监听、中间件和事件保留。
 
 ```bash
 npm install @dafengzhen/event-bus
 ```
 
-## 快速开始
+```ts
+import { createEventBus } from '@dafengzhen/event-bus';
 
-```typescript
-import { EventBus } from '@dafengzhen/event-bus';
-
-// 1. 定义事件映射
-type MyEvents = {
-  'user:login': { userId: string; timestamp: number };
-  'user:logout': { userId: string };
-  notification: { message: string; level: 'info' | 'warn' | 'error' };
-};
-
-// 2. 创建 EventBus 实例
-const bus = new EventBus<MyEvents>();
-
-// 3. 注册监听器
-bus.on('user:login', (payload, ctx) => {
-  console.log(`用户 ${payload.userId} 在 ${payload.timestamp} 登录`);
-});
-
-// 4. 触发事件
-bus.emit('user:login', { userId: 'abc123', timestamp: Date.now() });
-```
-
-## API
-
-### `EventBus<E>`
-
-#### 构造函数
-
-```typescript
-new EventBus<E>(options?: EventBusOptions<E>)
-```
-
-| 选项                        | 类型                   | 默认值                    | 描述                                          |
-| --------------------------- | ---------------------- | ------------------------- | --------------------------------------------- |
-| `logErrors`                 | `boolean`              | `true`                    | 是否将监听器/中间件错误输出到 `console.error` |
-| `onError`                   | `(e: unknown) => void` | —                         | 自定义错误处理器                              |
-| `clearGlobalCacheOnDispose` | `boolean`              | `false`                   | 销毁时是否清除全局正则编译缓存                |
-| `stickyMax`                 | `number`               | `200`                     | 全局粘性事件键的最大数量                      |
-| `stickyExactMax`            | `number`               | `1`                       | 每个精确事件键的最大粘性事件数                |
-| `stickyPatternMaxPerKey`    | `number`               | `stickyMax`               | 每个模式匹配键的最大粘性事件数                |
-| `runtime`                   | `DispatcherRuntime<E>` | `new DispatcherRuntime()` | 自定义调度器运行时                            |
-
-#### 注册监听器
-
-```typescript
-// 精确监听器 — 每次触发都会执行
-bus.on('user:login', (payload, ctx) => {
-  /*...*/
-});
-
-// 一次性监听器 — 首次触发后自动移除
-bus.once('user:login', (payload, ctx) => {
-  /*...*/
-});
-
-// 模式监听器 — 当事件键匹配模式时触发
-bus.onMatch(/^user:/, (event, payload, match, ctx) => {
-  console.log(`匹配的事件: ${event}`);
-});
-
-// 一次性模式监听器
-bus.onceMatch('user:login', (event, payload, match, ctx) => {
-  /*...*/
-});
-```
-
-所有注册方法都接受可选的 `OnOptions`：
-
-```typescript
-{
-  priority?: number;       // 优先级，数值越大越先执行（精确监听器默认 0，模式监听器默认 80）
-  consumeSticky?: boolean; // 覆盖粘性事件的消费行为
+interface Events {
+  'user:login': { id: string };
+  'user:logout': string;
+  ready: void;
 }
+
+const bus = createEventBus<Events>();
+const off = bus.on('user:login', ({ id }) => console.log(id));
+
+bus.emit('user:login', { id: 'Ada' });
+bus.emit('ready'); // void / undefined 负载可以省略
+
+off(); // 多次调用安全
 ```
 
-所有方法都返回一个 `Off` 函数用于取消注册：
+也可以使用 `new EventBus<Events>(options)`。事件映射支持接口和类型别名，无需索引签名。精确事件键支持字符串、数字和 symbol。每个事件携带一个负载，需要多个值时使用对象或元组。未知事件、缺少必需负载、事件键与负载类型不匹配都会产生类型错误。
 
-```typescript
-const off = bus.on('user:login', handler);
-off(); // 移除监听器
-```
+## 订阅
 
-#### 触发事件
-
-```typescript
-// 同步触发
-bus.emit('user:login', { userId: 'abc', timestamp: Date.now() });
-
-// 异步触发（支持异步中间件）
-await bus.emitAsync('user:login', { userId: 'abc', timestamp: Date.now() });
-
-// 带选项触发
-bus.emit('user:login', payload, {
-  sticky: true, // 存储为粘性事件，供后续注册的监听器重放
-  stickyMode: 'consume', // 'consume'（重放后移除）或 'replay'（默认，持久保留）
-  origin: 'auth-module', // 来源标记，便于调试
-  metaPatch: { requestId: 'req-1' }, // 共享元数据
+```ts
+bus.on('user:login', (payload, event) => {
+  console.log(payload.id, event.id, event.meta);
 });
+bus.once('ready', () => console.log('只执行一次'));
+
+bus.onPattern('user:.*', (event) => {
+  if (event.type === 'user:login') {
+    console.log(event.payload.id); // 自动收窄为 { id: string }
+  }
+});
+bus.onAny((event) => console.log(event.type, event.payload));
 ```
 
-#### 中间件
+`on`、`once` 接收 `(payload, event)`；`onAny`、`onPattern` 接收事件对象。事件对象是可辨识联合类型，检查 `event.type` 时，`event.payload` 会一起收窄。模式字符串本身不会在编译时收窄联合类型，需要在回调内检查事件名。
 
-```typescript
-// 同步中间件
-bus.use((ctx, next) => {
-  console.log(`处理中: ${String(ctx.event)}`);
-  next(); // 必须调用 next() 才能继续分发
+所有订阅方法都返回取消函数。同一个函数注册两次会创建两个独立订阅。
+
+| 订阅选项   | 默认值  | 行为                                                                 |
+| ---------- | ------- | -------------------------------------------------------------------- |
+| `priority` | `0`     | 越大越先执行；相同优先级按注册顺序执行，精确、模式、全局监听统一排序 |
+| `once`     | `false` | 在首次调用前移除，重放、嵌套分发也只执行一次                         |
+| `signal`   | —       | 中止时移除；已经中止的信号不会创建有效订阅                           |
+| `replay`   | `false` | 注册时同步重放匹配的已保留事件                                       |
+
+`once()` 固定使用 `once: true`。优先级必须是有限数字。
+
+### 模式匹配
+
+`onPattern(pattern, observer, options?)` 和中间件的 `pattern` 选项接受：
+
+- **derivative-matcher DSL 字符串**：`user:.*`、`(user|team):.*`、`user:.* & !(user:logout)`。
+- 原生 `RegExp`：例如 `/^user:/`，支持 JavaScript 正则标志和 Unicode。
+- 实现 `test(input: string): boolean` 的可复用匹配器，例如 `@dafengzhen/derivative-matcher` 的 `createPatternMatcher('user:.*')` 返回值。
+
+DSL 匹配**整个事件名**：`user:` 不匹配 `user:login`，应写成 `user:.*`。它不是 glob 通配符语法。DSL 字符范围为 Latin-1，忽略未转义的空白，不提供捕获组。原生正则使用 JavaScript 的搜索语义；每次注册独立管理正则游标，`g` / `y` 和调用方的 `lastIndex` 修改不会干扰分发。模式仅匹配字符串键，数字和 symbol 可通过 `onAny` 观察。非法 DSL 在注册时抛错；自定义匹配器应保持纯函数行为且不抛异常。
+
+## 分发
+
+```ts
+const result = bus.emit(
+  'user:login',
+  { id: 'Ada' },
+  {
+    meta: { requestId: 'req-1' },
+  },
+);
+console.log(result.delivered, result.errors, result.event);
+
+bus.on('user:logout', async (id) => {
+  await saveLogout(id);
 });
+await bus.emitAsync('user:logout', 'Ada');
+```
 
-// 异步中间件
-bus.useAsync(async (ctx, next) => {
-  await someAsyncOperation();
+`emit()` 同步执行；`emitAsync()` 按相同优先级顺序逐个执行并等待所有处理器。多个独立的 `emitAsync()` 调用可以并发，不使用全局队列。一次性订阅在调用前移除，因此并发分发也不会重复执行它。
+
+异步处理器应使用 `emitAsync()`。`emit()` 在执行处理器前检查匹配的 `useAsync()` 中间件并直接拒绝同步分发。如果监听器或 `use()` 中间件在同步分发时返回 Promise，则按分发错误策略报告 `TypeError`，并接住该 Promise 的拒绝；已经启动的异步操作无法撤销。重放也是同步的；需要异步处理已保留值时，可以先 `await bus.waitFor(type, { replay: true })`，再继续异步工作。
+
+分发开始时为监听器和中间件创建快照。分发中新注册的处理器从下一次事件开始参与；轮到执行前已移除或取消的处理器会跳过。`clear()`、`dispose()` 会停止进行中的分发后续步骤，包括尚在等待中间件的分发；已经运行的回调会正常结束。
+
+### 事件上下文
+
+| 字段                 | 含义                         |
+| -------------------- | ---------------------------- |
+| `type`、`payload`    | 保持类型关联的事件键与负载   |
+| `id`                 | 当前总线内递增的分发 ID      |
+| `timestamp`          | 发出事件时的 Unix 毫秒时间戳 |
+| `meta`               | 发出时元数据的浅冻结副本     |
+| `replayed`           | 当前调用是否为重放           |
+| `propagationStopped` | 可实时读取的传播状态         |
+| `stopPropagation()`  | 跳过后续中间件和监听器       |
+
+事件对象和分发结果被冻结。负载及嵌套元数据保留引用，不复制、不深冻结。重放保留原始 ID、时间戳、负载和元数据，但拥有独立传播状态。停止传播不会撤销已执行回调和副作用。
+
+## 中间件
+
+```ts
+const off = bus.use(
+  (event, next) => {
+    if (event.meta.blocked) return; // 不调用 next() 即阻止后续分发
+    next();
+  },
+  { pattern: 'user:.*' },
+);
+
+bus.useAsync(async (event, next) => {
+  await authorize(event);
   await next();
-});
-
-// 中间件流程控制
-bus.use((ctx, next) => {
-  ctx.stop(); // 停止传播（当前中间件仍可调用 next）
-  ctx.stopImmediate(); // 立即停止（不再执行后续中间件和监听器）
-  ctx.cancel(); // 完全取消事件
-  next();
-});
-
-// 条件中间件
-bus.use(logger, {
-  pattern: 'user:', // 仅对匹配此模式的事件执行
-  match: (ctx) => ctx.event !== 'user:logout', // 自定义断言
+  await audit(event);
 });
 ```
 
-#### 事件作用域
+中间件按注册顺序在监听器之前执行。每个中间件最多调用一次 `next()`，且必须在自身完成前调用。不调用 `next()` 会阻止后续执行与事件保留。调用 `stopPropagation()` 后，即使再调用 `next()`，也不会执行下游。中间件接受 `{ pattern?, signal? }`，注册后返回取消函数。
 
-作用域提供监听器和中间件的自动清理：
+`use()` 是同步中间件。在 `emitAsync()` 中，其 `next()` 启动下游但无法同步等待异步工作；需要包围异步分发执行前后逻辑时，使用 `useAsync()` 和 `await next()`。即使忘记等待 `next()`，分发也会等待已经启动的下游完成；中间件自身仍应正确等待，以保证前后逻辑的顺序。
 
-```typescript
-const scope = bus.createScope();
+## 等待事件
 
-// 所有注册都绑定到此作用域
-scope.on('user:login', handler);
-scope.use(middleware);
+```ts
+const controller = new AbortController();
+const login = bus.waitFor('user:login', {
+  filter: (payload) => payload.id === 'Ada',
+  timeout: 5_000,
+  signal: controller.signal,
+  replay: true,
+});
 
-// 销毁作用域以清理所有绑定在其上的注册
-scope.dispose();
-
-// 嵌套作用域实现分层生命周期
-const childScope = bus.createScope(scope);
-childScope.dispose(); // 父作用域不受影响
+bus.emit('user:login', { id: 'Ada' });
+console.log((await login).payload.id);
 ```
 
-使用 `withScope` 创建临时作用域：
+`waitFor` 返回事件上下文，结束后自动清理监听器、中止钩子和计时器。`filter` 默认接收所有负载，`replay` 默认为 `false`，不传 `timeout` 则不限时。超时必须是 `0` 至 `2147483647` 之间的有限毫秒数。超时以 `TimeoutError` 拒绝，中止以信号的 `reason` 拒绝。过滤函数抛错只拒绝等待，不使事件分发失败。`clear()`、总线销毁、所属作用域销毁会以 `AbortError` 拒绝尚未完成的等待。调用方需要处理 Promise 拒绝。
 
-```typescript
-await bus.withScope(async (scope) => {
-  scope.on('user:login', handler);
-  // ... handler 在作用域销毁时自动移除
+## 保留与重放
+
+```ts
+bus.emit('ready', undefined, { retain: true });
+bus.once('ready', (_, event) => console.log(event.replayed), { replay: true });
+
+bus.clearRetained('ready');
+bus.clearRetained(); // 清除所有键
+```
+
+每个键只保留最新的一条事件，更新时替换旧值。事件经过中间件、到达监听器阶段时保留，在监听器调用之前写入；监听器随后失败也不回滚保留值。被中间件阻止的事件不会保留。未设置 `retain: true` 的普通分发不会覆盖或清除旧保留值。
+
+迟到的订阅只有显式开启 `replay` 才会重放。重放只调用新订阅，不经过中间件、不触发其他监听器。多个匹配键按最后保留更新时间从旧到新重放。`once` 重放第一条匹配值后立即取消。如果重放出现未处理错误，注册方法抛错前会移除新订阅。
+
+`createEventBus({ retainedLimit: 100 })` 限制保留的不同键数量，默认 `100`。更新已有键会刷新顺序，超过上限时淘汰最久未更新的键。`0` 禁用保留；上限必须是非负安全整数。销毁总线不会清理 derivative-matcher 的共享编译缓存。
+
+## 作用域与清理
+
+```ts
+const scope = bus.scope();
+const child = scope.scope();
+
+scope.on('user:login', ({ id }) => console.log(id));
+child.onAny((event) => console.log(event.type));
+const pending = child.waitFor('ready');
+
+scope.dispose(); // 同时销毁 child 并拒绝 pending
+await pending.catch(() => {});
+```
+
+作用域提供 `on`、`once`、`onAny`、`onPattern`、`use`、`useAsync`、`waitFor`、`scope`、`dispose`、`signal`、`disposed`。通过总线发出事件。所有权显式指定，跨 `await` 不会串作用域；无需隐式上下文或全局运行时。传入的订阅信号与作用域信号共同控制取消。销毁子作用域不影响父作用域和兄弟作用域；销毁总线会销毁全部作用域。销毁可重复调用。通过已销毁实例注册会抛错；`waitFor` 返回拒绝的 Promise。
+
+| 总线成员               | 行为                                                       |
+| ---------------------- | ---------------------------------------------------------- |
+| `listenerCount()`      | 有效监听注册总数，不含中间件                               |
+| `listenerCount(type)`  | 匹配指定键的精确、模式、全局监听总数                       |
+| `clearRetained(type?)` | 仅清除保留数据                                             |
+| `clear()`              | 清除监听、中间件和保留数据，拒绝等待；总线和作用域仍可复用 |
+| `dispose()`            | 完整清理并永久关闭总线和所有作用域                         |
+| `disposed`             | 是否永久关闭                                               |
+
+## 错误处理
+
+默认收集监听错误并继续执行其他监听器，最后抛出 `AggregateError`；`emitAsync()` 对应拒绝 Promise。中间件失败会阻止尚未启动的下游；通过 `next()` 已经启动的下游可以完成。配置错误与模式编译错误直接抛出。
+
+```ts
+const bus = createEventBus<Events>({
+  onError: ({ error, event, phase }) => {
+    console.error(event.type, phase, error);
+  },
 });
 ```
 
-#### 粘性事件
+`onError` 在分发结束后逐条同步处理失败，提供该回调即表示接管错误。返回结果仍包含 `errors: readonly DispatchFailure[]`，每条具有 `error`、`event` 和 `phase`（`listener`、`middleware`、`replay`）。`delivered` 统计调用次数，包含失败调用。错误回调自身抛错会被聚合并向调用方传播，不递归上报。不要传入异步错误回调。
 
-粘性事件会在事件触发之后注册的监听器中重放：
+## 开发
 
-```typescript
-// 触发粘性事件
-bus.emit('user:login', { userId: 'abc', timestamp: Date.now() }, { sticky: true });
+开发需要 Node.js `^20.19.0 || >=22.12.0`，使用类型声明需要 TypeScript 5.4+。浏览器运行时需要 `AbortController`、`AbortSignal.any`（组合调用方和作用域信号时）、`DOMException`、`AggregateError`；构建不会注入运行时 polyfill。
 
-// 后续注册的监听器会立即收到粘性事件
-bus.on('user:login', (payload) => {
-  console.log(payload.userId); // 'abc'
-});
+```bash
+npm ci
+npm run check         # 类型、lint、格式、测试、全部构建与包入口检查
+npm run coverage      # 覆盖率与门槛检查
+npm run dev           # 交互示例
+npm run build:example
 ```
 
-粘性模式：
+提供 ESM / CommonJS 及各自类型声明，以及现代 / legacy 语法构建。`/legacy` 仅改变输出语法目标。`scripts/build.mjs` 构建库，`vite.config.ts` 用于示例开发和构建。
 
-- `'replay'`（默认）— 事件持久保留，对所有后续监听器重放
-- `'consume'` — 事件在重放一次后被移除
-
-#### 生命周期
-
-```typescript
-bus.clearAll(); // 移除所有监听器、中间件和粘性事件
-bus.clearListeners(); // 仅移除监听器（保留中间件和粘性事件）
-bus.dispose(); // 完全清理 — 实例不可再使用
-```
-
-### 监听器上下文
-
-监听器接收一个冻结的上下文对象，包含响应式生命周期状态：
-
-```typescript
-bus.on('user:login', (payload, ctx) => {
-  ctx.event; // 事件键
-  ctx.payload; // 事件负载
-  ctx.id; // 单调递增的触发 ID
-  ctx.timestamp; // 触发时的 Unix 时间戳
-  ctx.origin; // 可选的来源标记
-  ctx.isStopped; // 传播是否已被停止
-  ctx.isCanceled; // 事件是否已被取消
-  ctx.isImmediateStopped; // 是否已调用立即停止
-  ctx.meta; // 共享元数据（只读）
-  ctx.phase; // 'exact' 或 'pattern'
-});
-```
-
-### 模式处理器
-
-模式处理器接收额外的匹配信息：
-
-```typescript
-bus.onMatch(/^user:(?<action>\w+)$/, (event, payload, match, ctx) => {
-  console.log(match.action); // 命名捕获组的值
-});
-```
-
-## License
+## 许可
 
 [MIT](./LICENSE)

@@ -1,244 +1,217 @@
 # event-bus
 
-[![GitHub License](https://img.shields.io/github/license/dafengzhen/event-bus?color=blue)](https://github.com/dafengzhen/event-bus)
-[![npm version](https://img.shields.io/npm/v/@dafengzhen/event-bus)](https://www.npmjs.com/package/@dafengzhen/event-bus)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dafengzhen/event-bus/pulls)
-
 [简体中文](./README.zh.md)
 
-A lightweight, fully typed TypeScript event bus with middleware pipeline, pattern-based event listeners, sticky events, and scoped lifecycle management.
-
-## Features
-
-- **Strongly Typed** — Full type safety for event keys, payloads, and listener contexts
-- **Middleware Pipeline** — Sync and async middleware with `stop()`, `cancel()`, and `stopImmediate()` flow control
-- **Pattern Matching** — Register listeners on regex or string patterns (DFA-compiled for performance)
-- **Sticky Events** — Replay events to listeners that register after the event was emitted
-- **Event Scopes** — Automatic cleanup of listeners and middleware via lifecycle-scoped containers
-- **Priority Ordering** — Control listener execution order with priority values
-- **Error Handling** — Configurable error logging and custom error handler
-
-## Installation
+A typed TypeScript event bus with explicit lifetimes, pattern observers, middleware, and retained events.
 
 ```bash
 npm install @dafengzhen/event-bus
 ```
 
-## Quick Start
+```ts
+import { createEventBus } from '@dafengzhen/event-bus';
 
-```typescript
-import { EventBus } from '@dafengzhen/event-bus';
-
-// 1. Define your event map
-type MyEvents = {
-  'user:login': { userId: string; timestamp: number };
-  'user:logout': { userId: string };
-  notification: { message: string; level: 'info' | 'warn' | 'error' };
-};
-
-// 2. Create an EventBus instance
-const bus = new EventBus<MyEvents>();
-
-// 3. Register listeners
-bus.on('user:login', (payload, ctx) => {
-  console.log(`User ${payload.userId} logged in at ${payload.timestamp}`);
-});
-
-// 4. Emit events
-bus.emit('user:login', { userId: 'abc123', timestamp: Date.now() });
-```
-
-## API
-
-### `EventBus<E>`
-
-#### Constructor
-
-```typescript
-new EventBus<E>(options?: EventBusOptions<E>)
-```
-
-| Option                      | Type                   | Default                   | Description                                         |
-| --------------------------- | ---------------------- | ------------------------- | --------------------------------------------------- |
-| `logErrors`                 | `boolean`              | `true`                    | Log listener/middleware errors to `console.error`   |
-| `onError`                   | `(e: unknown) => void` | —                         | Custom error handler for listener/middleware errors |
-| `clearGlobalCacheOnDispose` | `boolean`              | `false`                   | Clear the global regex compile cache on disposal    |
-| `stickyMax`                 | `number`               | `200`                     | Max number of distinct sticky event keys            |
-| `stickyExactMax`            | `number`               | `1`                       | Max sticky events per exact event key               |
-| `stickyPatternMaxPerKey`    | `number`               | `stickyMax`               | Max sticky events per pattern-matched key           |
-| `runtime`                   | `DispatcherRuntime<E>` | `new DispatcherRuntime()` | Custom dispatcher runtime                           |
-
-#### Registering Listeners
-
-```typescript
-// Exact listener — fires on every emission
-bus.on('user:login', (payload, ctx) => {
-  /*...*/
-});
-
-// One-time listener — auto-removed after first invocation
-bus.once('user:login', (payload, ctx) => {
-  /*...*/
-});
-
-// Pattern listener — fires when event key matches the pattern
-bus.onMatch(/^user:/, (event, payload, match, ctx) => {
-  console.log(`Matched event: ${event}`);
-});
-
-// One-time pattern listener
-bus.onceMatch('user:login', (event, payload, match, ctx) => {
-  /*...*/
-});
-```
-
-All registration methods accept an optional `OnOptions`:
-
-```typescript
-{
-  priority?: number;       // Higher = earlier execution (default: 0 for exact, 80 for pattern)
-  consumeSticky?: boolean; // Override sticky consumption behavior
+interface Events {
+  'user:login': { id: string };
+  'user:logout': string;
+  ready: void;
 }
+
+const bus = createEventBus<Events>();
+const off = bus.on('user:login', ({ id }) => console.log(id));
+
+bus.emit('user:login', { id: 'Ada' });
+bus.emit('ready'); // void / undefined payloads may be omitted
+
+off(); // idempotent
 ```
 
-All return an `Off` function to unregister:
+`new EventBus<Events>(options)` is also available. Event maps can be interfaces or type aliases; no index signature is required. Exact keys support strings, numbers, and symbols. There is one payload per event; use an object or tuple when you need several values. Invalid keys, missing required payloads, and mismatched key/payload pairs are type errors.
 
-```typescript
-const off = bus.on('user:login', handler);
-off(); // Remove the listener
-```
+## Subscribe
 
-#### Emitting Events
-
-```typescript
-// Synchronous emit
-bus.emit('user:login', { userId: 'abc', timestamp: Date.now() });
-
-// Async emit (supports async middleware)
-await bus.emitAsync('user:login', { userId: 'abc', timestamp: Date.now() });
-
-// With options
-bus.emit('user:login', payload, {
-  sticky: true, // Store for replay to future listeners
-  stickyMode: 'consume', // 'consume' (remove after replay) or 'replay' (default, persist)
-  origin: 'auth-module', // Origin tag for debugging
-  metaPatch: { requestId: 'req-1' }, // Shared metadata
+```ts
+bus.on('user:login', (payload, event) => {
+  console.log(payload.id, event.id, event.meta);
 });
+bus.once('ready', () => console.log('once'));
+
+bus.onPattern('user:.*', (event) => {
+  if (event.type === 'user:login') {
+    console.log(event.payload.id); // narrowed to { id: string }
+  }
+});
+bus.onAny((event) => console.log(event.type, event.payload));
 ```
 
-#### Middleware
+`on` and `once` receive `(payload, event)`. `onAny` and `onPattern` receive a discriminated event object, preserving the relationship between `type` and `payload`. Pattern matches do not narrow the event union statically: narrow `event.type` inside the callback.
 
-```typescript
-// Synchronous middleware
-bus.use((ctx, next) => {
-  console.log(`Processing: ${String(ctx.event)}`);
-  next(); // Must call next() to continue dispatch
+All subscription methods return an unsubscribe function. Registering the same function twice creates two independent subscriptions.
+
+| Subscription option | Default | Behavior                                                                                           |
+| ------------------- | ------- | -------------------------------------------------------------------------------------------------- |
+| `priority`          | `0`     | Higher runs first; equal values follow registration order across exact, pattern, and any listeners |
+| `once`              | `false` | Unsubscribe before the first invocation, including replay and nested dispatch                      |
+| `signal`            | —       | Unsubscribe on abort; an already-aborted signal registers nothing                                  |
+| `replay`            | `false` | Synchronously deliver matching retained events during registration                                 |
+
+`once()` always sets `once: true`. Priorities must be finite numbers.
+
+### Patterns
+
+`onPattern(pattern, observer, options?)` and middleware's `pattern` option accept:
+
+- A string in **derivative-matcher DSL**: `user:.*`, `(user|team):.*`, `user:.* & !(user:logout)`.
+- A native `RegExp`: `/^user:/`, including Unicode patterns and regex flags.
+- A reusable matcher with `test(input: string): boolean`, such as `createPatternMatcher('user:.*')` from `@dafengzhen/derivative-matcher`.
+
+DSL patterns match the **entire event name**: `user:` does not match `user:login`; use `user:.*`. They are not glob patterns. The DSL's supported alphabet is Latin-1, unescaped whitespace is ignored, and it supplies boolean results without captures. Native regexes use JavaScript's normal search semantics. Each regex registration owns its cursor, so `g`/`y` and changes to the caller's `lastIndex` do not affect delivery. Pattern observers only match string keys; `onAny` also sees number and symbol keys. Invalid DSL patterns throw during registration. Custom matchers should be pure and nonthrowing.
+
+## Dispatch
+
+```ts
+const result = bus.emit(
+  'user:login',
+  { id: 'Ada' },
+  {
+    meta: { requestId: 'req-1' },
+  },
+);
+console.log(result.delivered, result.errors, result.event);
+
+bus.on('user:logout', async (id) => {
+  await saveLogout(id);
 });
+await bus.emitAsync('user:logout', 'Ada');
+```
 
-// Async middleware
-bus.useAsync(async (ctx, next) => {
-  await someAsyncOperation();
+`emit()` delivers synchronously. `emitAsync()` delivers sequentially and awaits every handler, preserving the same priority order. Separate `emitAsync()` calls may overlap; there is no global queue. A `once` subscription is removed before invocation, so concurrent dispatches cannot invoke it twice.
+
+Use `emitAsync()` for asynchronous handlers. `emit()` rejects matching `useAsync()` middleware before running handlers. If a listener or `use()` middleware returns a promise during synchronous delivery, it is reported as a `TypeError` through the dispatch error policy, and its rejection is observed. The already-started async operation cannot be undone. Replay is synchronous too; use `waitFor(type, { replay: true })` when you want to await a retained value and then do async work.
+
+Dispatch snapshots subscriptions and middleware at its start. Registrations added during dispatch participate in later emissions. Registrations removed or aborted before their turn are skipped. `clear()` and `dispose()` stop the remaining work of an in-flight dispatch, including work waiting on middleware; already-running callbacks complete normally.
+
+### Event context
+
+| Field                | Meaning                                        |
+| -------------------- | ---------------------------------------------- |
+| `type`, `payload`    | Correlated key and payload                     |
+| `id`                 | Increasing emission ID, local to the bus       |
+| `timestamp`          | Emission time in milliseconds since Unix epoch |
+| `meta`               | A shallow frozen copy of emission metadata     |
+| `replayed`           | Whether this invocation is a replay            |
+| `propagationStopped` | Reactive propagation state                     |
+| `stopPropagation()`  | Skip subsequent middleware and listeners       |
+
+The event object and dispatch result are frozen. Payloads and nested metadata are shared by reference, without cloning or deep freezing. Replay preserves the original ID, timestamp, payload, and metadata, with fresh propagation state. Stopping propagation affects delivery, without undoing callbacks or side effects that already ran.
+
+## Middleware
+
+```ts
+const off = bus.use(
+  (event, next) => {
+    if (event.meta.blocked) return; // omit next() to prevent delivery
+    next();
+  },
+  { pattern: 'user:.*' },
+);
+
+bus.useAsync(async (event, next) => {
+  await authorize(event);
   await next();
-});
-
-// Middleware flow control
-bus.use((ctx, next) => {
-  ctx.stop(); // Stop propagation (current middleware may still call next)
-  ctx.stopImmediate(); // Stop immediately (no further middleware or listeners)
-  ctx.cancel(); // Cancel the event entirely
-  next();
-});
-
-// Conditional middleware
-bus.use(logger, {
-  pattern: 'user:', // Only run for events matching this pattern
-  match: (ctx) => ctx.event !== 'user:logout', // Custom predicate
+  await audit(event);
 });
 ```
 
-#### Event Scopes
+Middleware runs in registration order before listeners. Call `next()` at most once and before the middleware completes. Omitting `next()` prevents downstream execution and retention. `event.stopPropagation()` also prevents downstream execution, even if you call `next()` afterward. Middleware supports `{ pattern?, signal? }`; all registration methods return an unsubscribe function.
 
-Scopes provide automatic cleanup of listeners and middleware:
+`use()` is synchronous. In `emitAsync()`, its `next()` starts the downstream work but cannot synchronously wait for it; use `useAsync()` and `await next()` for before/after logic around async delivery. Dispatch also drains an unawaited `next()` before completing, but middleware should await it to preserve its own before/after ordering.
 
-```typescript
-const scope = bus.createScope();
+## Wait for an event
 
-// All registrations are bound to the scope
-scope.on('user:login', handler);
-scope.use(middleware);
+```ts
+const controller = new AbortController();
+const login = bus.waitFor('user:login', {
+  filter: (payload) => payload.id === 'Ada',
+  timeout: 5_000,
+  signal: controller.signal,
+  replay: true,
+});
 
-// Dispose to clean up all scope-bound registrations
-scope.dispose();
-
-// Nest scopes for hierarchical lifecycle
-const childScope = bus.createScope(scope);
-childScope.dispose(); // Parent scope is unaffected
+bus.emit('user:login', { id: 'Ada' });
+console.log((await login).payload.id);
 ```
 
-Use `withScope` for temporary scopes:
+`waitFor` resolves to the event context and automatically removes its listener, abort hook, and timeout. `filter` defaults to accepting every payload, `replay` defaults to `false`, and no timeout is applied unless provided. Timeout must be a finite number from `0` to `2147483647` milliseconds. Timeout rejects with `TimeoutError`; abort rejects with the signal's reason. Filter exceptions reject the wait without failing the emission. `clear()`, bus disposal, and owning scope disposal reject pending waits with `AbortError`. Rejections from `waitFor` must be handled by the caller.
 
-```typescript
-await bus.withScope(async (scope) => {
-  scope.on('user:login', handler);
-  // ... handler is automatically removed when scope is disposed
+## Retain and replay
+
+```ts
+bus.emit('ready', undefined, { retain: true });
+bus.once('ready', (_, event) => console.log(event.replayed), { replay: true });
+
+bus.clearRetained('ready');
+bus.clearRetained(); // all keys
+```
+
+Retention stores the latest event per key, replacing its previous value. Events are retained when middleware reaches the listener stage, before listeners run, even if a listener later fails. Emissions blocked by middleware are not retained. Ordinary emissions without `retain: true` leave any previous retained value unchanged.
+
+Late listeners only replay when explicitly requested. Replay invokes only the new subscriber, bypassing middleware and other listeners. Matching keys replay in order of their last retained update, oldest first. `once` with replay receives the first matching retained value and unsubscribes. If replay throws an unhandled error, the new subscription is removed before the registration call throws.
+
+`createEventBus({ retainedLimit: 100 })` limits distinct retained keys (default `100`). Updating a key refreshes its position; the oldest updated key is evicted when the limit is exceeded. `0` disables retention. The limit must be a nonnegative safe integer. Disposing a bus never clears derivative-matcher's shared compilation cache.
+
+## Scopes and cleanup
+
+```ts
+const scope = bus.scope();
+const child = scope.scope();
+
+scope.on('user:login', ({ id }) => console.log(id));
+child.onAny((event) => console.log(event.type));
+const pending = child.waitFor('ready');
+
+scope.dispose(); // also disposes child and rejects pending
+await pending.catch(() => {});
+```
+
+Scopes expose `on`, `once`, `onAny`, `onPattern`, `use`, `useAsync`, `waitFor`, `scope`, `dispose`, `signal`, and `disposed`. Emit through the bus. Ownership is explicit and stays correct across `await`; there is no ambient scope or global runtime. Subscription signals combine caller cancellation with scope cancellation. Disposing a child leaves its parent and siblings active; disposing the bus disposes all scopes. Disposal is idempotent. Registration through a disposed bus or scope throws; `waitFor` returns a rejected promise.
+
+| Bus method             | Behavior                                                                                    |
+| ---------------------- | ------------------------------------------------------------------------------------------- |
+| `listenerCount()`      | Total active listener registrations, excluding middleware                                   |
+| `listenerCount(type)`  | Exact, pattern, and any listeners matching a key                                            |
+| `clearRetained(type?)` | Forget retained data only                                                                   |
+| `clear()`              | Remove listeners, middleware, and retained data; reject waits; keep bus and scopes reusable |
+| `dispose()`            | Clear everything and permanently close the bus and its scopes                               |
+| `disposed`             | Whether permanently closed                                                                  |
+
+## Errors
+
+By default, listener errors are collected while other listeners continue; dispatch then throws `AggregateError` (`emitAsync` rejects). A middleware failure prevents its unstarted downstream work; downstream work already started through `next()` is allowed to complete. Configuration and pattern compilation errors throw directly.
+
+```ts
+const bus = createEventBus<Events>({
+  onError: ({ error, event, phase }) => {
+    console.error(event.type, phase, error);
+  },
 });
 ```
 
-#### Sticky Events
+`onError` runs synchronously after delivery for each failure and handles that failure. The returned result still contains `errors: readonly DispatchFailure[]`; each entry has `error`, `event`, and `phase` (`listener`, `middleware`, or `replay`). `delivered` counts invocations, including failed ones. An error thrown by `onError` is aggregated and propagated without recursive reporting. Do not provide an async error handler.
 
-Sticky events are replayed to listeners that register after the event was emitted:
+## Development
 
-```typescript
-// Emit a sticky event
-bus.emit('user:login', { userId: 'abc', timestamp: Date.now() }, { sticky: true });
+Requires Node.js `^20.19.0 || >=22.12.0` and TypeScript 5.4+ for consuming declarations. Browser runtimes need `AbortController`, `AbortSignal.any` (when combining scope and caller signals), `DOMException`, and `AggregateError`; syntax bundles do not inject runtime polyfills.
 
-// Late-registering listener receives the sticky event immediately
-bus.on('user:login', (payload) => {
-  console.log(payload.userId); // 'abc'
-});
+```bash
+npm ci
+npm run check         # types, lint, formatting, tests, all bundles, package exports
+npm run coverage      # coverage thresholds
+npm run dev          # interactive playground
+npm run build:example
 ```
 
-Sticky modes:
-
-- `'replay'` (default) — Event persists and replays to all future listeners
-- `'consume'` — Event is removed after being replayed once
-
-#### Lifecycle
-
-```typescript
-bus.clearAll(); // Remove all listeners, middleware, and sticky events
-bus.clearListeners(); // Remove only listeners (keep middleware & sticky events)
-bus.dispose(); // Full cleanup — instance cannot be used again
-```
-
-### Listener Context
-
-Listeners receive a frozen context object with reactive lifecycle state:
-
-```typescript
-bus.on('user:login', (payload, ctx) => {
-  ctx.event; // The event key
-  ctx.payload; // The event payload
-  ctx.id; // Monotonic emit ID
-  ctx.timestamp; // Unix timestamp of emission
-  ctx.origin; // Optional origin tag
-  ctx.isStopped; // Whether propagation has been stopped
-  ctx.isCanceled; // Whether the event has been canceled
-  ctx.isImmediateStopped; // Whether immediate stop was called
-  ctx.meta; // Shared metadata (readonly)
-  ctx.phase; // 'exact' or 'pattern'
-});
-```
-
-### Pattern Handlers
-
-Pattern handlers receive additional match information:
-
-```typescript
-bus.onMatch(/^user:(?<action>\w+)$/, (event, payload, match, ctx) => {
-  console.log(match.action); // Named capture group value
-});
-```
+The package supplies ESM and CommonJS declarations and modern/legacy syntax bundles. The `/legacy` entry changes the syntax target only. `scripts/build.mjs` builds the library; `vite.config.ts` serves/builds the playground.
 
 ## License
 
