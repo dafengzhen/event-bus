@@ -1,4 +1,4 @@
-import { createPatternMatcher } from '@dafengzhen/derivative-matcher';
+import { compile } from '@dafengzhen/derivative-matcher';
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import type { EventContext, EventScope } from './index.js';
@@ -171,7 +171,7 @@ describe('pattern matching', () => {
   it('accepts reusable compiled matchers', () => {
     const bus = makeBus();
     const listener = vi.fn<(...args: any[]) => void>();
-    bus.onPattern(createPatternMatcher('count'), listener, { once: true });
+    bus.onPattern(compile('count'), listener, { once: true });
     bus.emit('count', 1);
     bus.emit('count', 2);
     expect(listener).toHaveBeenCalledTimes(1);

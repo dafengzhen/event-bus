@@ -63,7 +63,7 @@ All subscription methods return an unsubscribe function. Registering the same fu
 
 - A string in **derivative-matcher DSL**: `user:.*`, `(user|team):.*`, `user:.* & !(user:logout)`.
 - A native `RegExp`: `/^user:/`, including Unicode patterns and regex flags.
-- A reusable matcher with `test(input: string): boolean`, such as `createPatternMatcher('user:.*')` from `@dafengzhen/derivative-matcher`.
+- A reusable matcher with `test(input: string): boolean`, such as `compile('user:.*')` from `@dafengzhen/derivative-matcher`.
 
 DSL patterns match the **entire event name**: `user:` does not match `user:login`; use `user:.*`. They are not glob patterns. The DSL's supported alphabet is Latin-1, unescaped whitespace is ignored, and it supplies boolean results without captures. Native regexes use JavaScript's normal search semantics. Each regex registration owns its cursor, so `g`/`y` and changes to the caller's `lastIndex` do not affect delivery. Pattern observers only match string keys; `onAny` also sees number and symbol keys. Invalid DSL patterns throw during registration. Custom matchers should be pure and nonthrowing.
 

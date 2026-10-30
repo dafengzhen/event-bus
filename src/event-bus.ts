@@ -1,4 +1,4 @@
-import { createPatternMatcher } from '@dafengzhen/derivative-matcher';
+import { compile } from '@dafengzhen/derivative-matcher';
 
 import type {
   AsyncMiddleware,
@@ -582,7 +582,7 @@ function callSync<Args extends unknown[]>(
 }
 
 function compilePattern(pattern: EventPattern): (type: PropertyKey) => boolean {
-  const matcher = typeof pattern === 'string' ? createPatternMatcher(pattern) : pattern;
+  const matcher = typeof pattern === 'string' ? compile(pattern) : pattern;
   // Own the cursor: g/y regexes and caller mutations cannot affect matching.
   if (matcher instanceof RegExp) {
     const regex = new RegExp(matcher.source, matcher.flags);

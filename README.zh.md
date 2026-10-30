@@ -63,7 +63,7 @@ bus.onAny((event) => console.log(event.type, event.payload));
 
 - **derivative-matcher DSL 字符串**：`user:.*`、`(user|team):.*`、`user:.* & !(user:logout)`。
 - 原生 `RegExp`：例如 `/^user:/`，支持 JavaScript 正则标志和 Unicode。
-- 实现 `test(input: string): boolean` 的可复用匹配器，例如 `@dafengzhen/derivative-matcher` 的 `createPatternMatcher('user:.*')` 返回值。
+- 实现 `test(input: string): boolean` 的可复用匹配器，例如 `@dafengzhen/derivative-matcher` 的 `compile('user:.*')` 返回值。
 
 DSL 匹配**整个事件名**：`user:` 不匹配 `user:login`，应写成 `user:.*`。它不是 glob 通配符语法。DSL 字符范围为 Latin-1，忽略未转义的空白，不提供捕获组。原生正则使用 JavaScript 的搜索语义；每次注册独立管理正则游标，`g` / `y` 和调用方的 `lastIndex` 修改不会干扰分发。模式仅匹配字符串键，数字和 symbol 可通过 `onAny` 观察。非法 DSL 在注册时抛错；自定义匹配器应保持纯函数行为且不抛异常。
 
