@@ -199,20 +199,6 @@ const bus = createEventBus<Events>({
 
 `onError` 在分发结束后逐条同步处理失败，提供该回调即表示接管错误。返回结果仍包含 `errors: readonly DispatchFailure[]`，每条具有 `error`、`event` 和 `phase`（`listener`、`middleware`、`replay`）。`delivered` 统计调用次数，包含失败调用。错误回调自身抛错会被聚合并向调用方传播，不递归上报。不要传入异步错误回调。
 
-## 开发
-
-开发需要 Node.js `^20.19.0 || >=22.12.0`，使用类型声明需要 TypeScript 5.4+。浏览器运行时需要 `AbortController`、`AbortSignal.any`（组合调用方和作用域信号时）、`DOMException`、`AggregateError`；构建不会注入运行时 polyfill。
-
-```bash
-npm ci
-npm run check         # 类型、lint、格式、测试、全部构建与包入口检查
-npm run coverage      # 覆盖率与门槛检查
-npm run dev           # 交互示例
-npm run build:example
-```
-
-提供 ESM / CommonJS 及各自类型声明，以及现代 / legacy 语法构建。`/legacy` 仅改变输出语法目标。`scripts/build.mjs` 构建库，`vite.config.ts` 用于示例开发和构建。
-
 ## 许可
 
 [MIT](./LICENSE)

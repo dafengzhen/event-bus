@@ -30,8 +30,20 @@ export interface EmitOptions {
 export interface EventBusOptions<E extends object> {
   /** Handles errors; otherwise dispatch throws AggregateError after delivery. */
   readonly onError?: (failure: DispatchFailure<E>) => void;
+  /** Override host APIs; inherited by every scope. */
+  readonly platform?: Partial<EventBusPlatform>;
   /** Maximum retained keys. Oldest updated key is evicted. Default: 100. */
   readonly retainedLimit?: number;
+}
+export interface EventBusPlatform {
+  /** Receives the opaque handle returned by setTimeout. */
+  readonly clearTimeout: (timer: unknown) => void;
+  /** Supply a compatible controller in hosts without native AbortController. */
+  readonly createAbortController: () => AbortController;
+  /** Defaults to DOMException, or an Error with the same name when unavailable. */
+  readonly createError: (message: string, name: 'AbortError' | 'TimeoutError') => Error;
+  /** Schedule asynchronously, like the host setTimeout. Override with clearTimeout as a pair. */
+  readonly setTimeout: (callback: () => void, timeout: number) => unknown;
 }
 /** Narrowing type also narrows payload. */
 export type EventContext<E extends object, K extends keyof E = keyof E> = {

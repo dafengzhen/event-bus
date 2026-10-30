@@ -199,20 +199,6 @@ const bus = createEventBus<Events>({
 
 `onError` runs synchronously after delivery for each failure and handles that failure. The returned result still contains `errors: readonly DispatchFailure[]`; each entry has `error`, `event`, and `phase` (`listener`, `middleware`, or `replay`). `delivered` counts invocations, including failed ones. An error thrown by `onError` is aggregated and propagated without recursive reporting. Do not provide an async error handler.
 
-## Development
-
-Requires Node.js `^20.19.0 || >=22.12.0` and TypeScript 5.4+ for consuming declarations. Browser runtimes need `AbortController`, `AbortSignal.any` (when combining scope and caller signals), `DOMException`, and `AggregateError`; syntax bundles do not inject runtime polyfills.
-
-```bash
-npm ci
-npm run check         # types, lint, formatting, tests, all bundles, package exports
-npm run coverage      # coverage thresholds
-npm run dev          # interactive playground
-npm run build:example
-```
-
-The package supplies ESM and CommonJS declarations and modern/legacy syntax bundles. The `/legacy` entry changes the syntax target only. `scripts/build.mjs` builds the library; `vite.config.ts` serves/builds the playground.
-
 ## License
 
 [MIT](./LICENSE)

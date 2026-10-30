@@ -6,6 +6,7 @@ import type {
   DispatchResult,
   EmitArgs,
   EventBusOptions,
+  EventBusPlatform,
   EventContext,
   EventMap,
   EventPattern,
@@ -20,6 +21,7 @@ import type {
 
 import { EventScope } from './event-scope.js';
 import { abortReason, onAbort } from './lifecycle.js';
+import { createPlatform } from './platform.js';
 
 interface Dispatch<E extends object> {
   delivered: number;
@@ -56,10 +58,11 @@ export class EventBus<E extends object = EventMap> {
   private eventId = 0;
   private readonly exact = new Map<keyof E, Set<ListenerEntry<E>>>();
   private generation = 0;
-  private readonly lifecycle = new AbortController();
+  private readonly lifecycle: AbortController;
   private readonly middleware = new Set<MiddlewareEntry<E>>();
   private readonly observers = new Set<ListenerEntry<E>>();
   private readonly options: EventBusOptions<E>;
+  private readonly platform: EventBusPlatform;
   private readonly retained = new Map<keyof E, EventContext<E>>();
   private sequence = 0;
 
@@ -71,13 +74,15 @@ export class EventBus<E extends object = EventMap> {
       throw new RangeError('retainedLimit must be a nonnegative safe integer.');
     }
     this.options = { ...options, retainedLimit };
+    this.platform = createPlatform(options.platform);
+    this.lifecycle = this.platform.createAbortController();
   }
 
   /** Remove subscriptions, middleware and retained data; reject pending waitFor calls. */
   clear(): void {
     this.generation += 1;
     for (const fail of this.waits) {
-      fail(new DOMException('EventBus was cleared', 'AbortError'));
+      fail(this.platform.createError('EventBus was cleared', 'AbortError'));
     }
     for (const entries of this.exact.values()) {
       for (const entry of entries) {
@@ -104,7 +109,7 @@ export class EventBus<E extends object = EventMap> {
 
   dispose(): void {
     if (!this.disposed) {
-      this.lifecycle.abort();
+      this.lifecycle.abort(this.platform.createError('The operation was aborted', 'AbortError'));
       this.clear();
     }
   }
@@ -247,7 +252,7 @@ export class EventBus<E extends object = EventMap> {
 
   scope(): EventScope<E> {
     this.assertActive();
-    return new EventScope(this, this.lifecycle.signal);
+    return new EventScope(this, this.lifecycle.signal, this.platform);
   }
 
   use(middleware: Middleware<E>, options?: MiddlewareOptions): Unsubscribe {
@@ -274,31 +279,36 @@ export class EventBus<E extends object = EventMap> {
       }
       let off: Unsubscribe = () => {};
       let detachSignal: Unsubscribe = () => {};
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      let timer: unknown;
+      let hasTimer = false;
       let settled = false;
       const cleanup = () => {
         settled = true;
         off();
         detachSignal();
         this.waits.delete(fail);
-        clearTimeout(timer);
+        if (hasTimer) {
+          this.platform.clearTimeout(timer);
+          hasTimer = false;
+        }
       };
       const fail = (reason: unknown) => {
         cleanup();
         reject(reason);
       };
       this.waits.add(fail);
-      detachSignal = onAbort(options.signal, () => fail(abortReason(options.signal!)));
+      detachSignal = onAbort(options, (signal) => fail(abortReason(signal, this.platform)));
       if (settled) {
         return;
       }
-      if (options.timeout !== undefined) {
-        timer = setTimeout(
-          () => fail(new DOMException('Timed out waiting for an event', 'TimeoutError')),
-          options.timeout,
-        );
-      }
       try {
+        if (options.timeout !== undefined) {
+          timer = this.platform.setTimeout(
+            () => fail(this.platform.createError('Timed out waiting for an event', 'TimeoutError')),
+            options.timeout,
+          );
+          hasTimer = true;
+        }
         off = this.on(
           type,
           (payload, event) => {
@@ -342,7 +352,7 @@ export class EventBus<E extends object = EventMap> {
       },
     };
     this.middleware.add(entry);
-    detach = onAbort(options.signal, entry.off);
+    detach = onAbort(options, entry.off);
     return entry.off;
   }
 
@@ -523,7 +533,7 @@ export class EventBus<E extends object = EventMap> {
       priority,
     };
     entries.add(entry);
-    detach = onAbort(options.signal, entry.off);
+    detach = onAbort(options, entry.off);
     if (entry.active && options.replay) {
       try {
         // Snapshot: replay callbacks can mutate retained data or emit recursively.

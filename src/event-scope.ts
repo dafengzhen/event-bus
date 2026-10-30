@@ -1,6 +1,8 @@
 import type { EventBus } from './event-bus.js';
+import type { LifecycleOptions } from './lifecycle.js';
 import type {
   AsyncMiddleware,
+  EventBusPlatform,
   EventContext,
   EventPattern,
   Listener,
@@ -12,7 +14,8 @@ import type {
   WaitForOptions,
 } from './types.js';
 
-import { abortReason, onAbort } from './lifecycle.js';
+import { abortReason, onAbort, scopeSignal } from './lifecycle.js';
+import { createPlatform } from './platform.js';
 
 /** Explicit ownership: disposing a parent also disposes its children. */
 export class EventScope<E extends object> {
@@ -24,19 +27,22 @@ export class EventScope<E extends object> {
   }
   private readonly bus: EventBus<E>;
 
-  private readonly controller = new AbortController();
+  private readonly controller: AbortController;
 
   private readonly detachParent: Unsubscribe;
+  private readonly platform: EventBusPlatform;
 
   /** Prefer bus.scope() or parent.scope(). */
-  constructor(bus: EventBus<E>, parent: AbortSignal) {
+  constructor(bus: EventBus<E>, parent: AbortSignal, platform?: Partial<EventBusPlatform>) {
     this.bus = bus;
-    this.detachParent = onAbort(parent, () => this.dispose());
+    this.platform = createPlatform(platform);
+    this.controller = this.platform.createAbortController();
+    this.detachParent = onAbort({ signal: parent }, () => this.dispose());
   }
 
   dispose(): void {
     if (!this.disposed) {
-      this.controller.abort();
+      this.controller.abort(this.platform.createError('The operation was aborted', 'AbortError'));
       this.detachParent?.();
     }
   }
@@ -71,7 +77,7 @@ export class EventScope<E extends object> {
 
   scope(): EventScope<E> {
     this.assertActive();
-    return new EventScope(this.bus, this.signal);
+    return new EventScope(this.bus, this.signal, this.platform);
   }
 
   use(middleware: Middleware<E>, options?: MiddlewareOptions): Unsubscribe {
@@ -87,7 +93,7 @@ export class EventScope<E extends object> {
     options: WaitForOptions<E, NoInfer<K>> = {},
   ): Promise<EventContext<E, K>> {
     if (this.disposed) {
-      return Promise.reject(abortReason(this.signal));
+      return Promise.reject(abortReason(this.signal, this.platform));
     }
     return this.bus.waitFor(type, this.bind(options));
   }
@@ -98,11 +104,8 @@ export class EventScope<E extends object> {
     }
   }
 
-  private bind<T extends { readonly signal?: AbortSignal }>(
-    options?: T,
-  ): { signal: AbortSignal } & T {
+  private bind<T extends { readonly signal?: AbortSignal }>(options?: T): LifecycleOptions & T {
     this.assertActive();
-    const signal = options?.signal ? AbortSignal.any([this.signal, options.signal]) : this.signal;
-    return { ...options, signal } as { signal: AbortSignal } & T;
+    return { ...options, [scopeSignal]: this.signal } as LifecycleOptions & T;
   }
 }

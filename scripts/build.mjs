@@ -79,7 +79,7 @@ function collectFiles(directory) {
 
 /**
  * Each variant owns its output directory, so emptyOutDir cannot erase sibling builds.
- * Dependencies, peer dependencies and node: imports remain external.
+ * Dependencies (including subpaths), peer dependencies and node: imports remain external.
  */
 function createConfig(variant, watch) {
   return {
@@ -95,11 +95,11 @@ function createConfig(variant, watch) {
       outDir: resolve(root, variant.outDir),
       reportCompressedSize: false,
       rolldownOptions: {
-        external: [
-          ...Object.keys(pkg.dependencies ?? {}),
-          ...Object.keys(pkg.peerDependencies ?? {}),
-          /^node:/,
-        ],
+        external: (id) =>
+          id.startsWith('node:') ||
+          [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.peerDependencies ?? {})].some(
+            (dependency) => id === dependency || id.startsWith(`${dependency}/`),
+          ),
       },
       sourcemap: true,
       target: variant.target,
