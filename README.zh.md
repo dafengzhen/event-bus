@@ -28,6 +28,36 @@ off(); // 多次调用安全
 
 也可以使用 `new EventBus<Events>(options)`。事件映射支持接口和类型别名，无需索引签名。精确事件键支持字符串、数字和 symbol。每个事件携带一个负载，需要多个值时使用对象或元组。未知事件、缺少必需负载、事件键与负载类型不匹配都会产生类型错误。
 
+## 包入口与兼容性
+
+| 包入口                         | ESM                                                             | CommonJS                                                             |
+| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `@dafengzhen/event-bus`        | `import { createEventBus } from '@dafengzhen/event-bus'`        | `const { createEventBus } = require('@dafengzhen/event-bus')`        |
+| `@dafengzhen/event-bus/legacy` | `import { createEventBus } from '@dafengzhen/event-bus/legacy'` | `const { createEventBus } = require('@dafengzhen/event-bus/legacy')` |
+
+两个入口提供相同 API，并分别提供 ESM 和 CommonJS 类型声明。
+
+两个入口都会加载 `core-js` 的 `AggregateError` 补丁。创建总线时必须有可用的 `AbortController`，可使用原生实现、polyfill 或 `platform.createAbortController`。无需 `AbortSignal.any()`。环境缺少 `DOMException` 时，取消和超时错误会回退为具有对应 `name` 的 `Error` 对象。
+
+### 自定义宿主 API
+
+使用 `platform` 适配宿主或测试环境中的取消机制、错误对象和计时器。只需传入要覆盖的成员；总线及通过 `scope()` 创建的所有作用域共用这些适配器。
+
+```ts
+const bus = createEventBus<Events>({
+  platform: {
+    createError: (message, name) => Object.assign(new Error(message), { name }),
+  },
+});
+```
+
+| `platform` 成员                 | 默认实现                                   | 要求                                                     |
+| ------------------------------- | ------------------------------------------ | -------------------------------------------------------- |
+| `createAbortController()`       | `new AbortController()`                    | 返回兼容的控制器，其信号支持中止事件监听                 |
+| `createError(message, name)`    | `DOMException`，不可用时回退为具名 `Error` | 返回名称为 `AbortError` 或 `TimeoutError` 的错误         |
+| `setTimeout(callback, timeout)` | 宿主 `setTimeout`                          | 异步调度回调，返回不透明计时器句柄                       |
+| `clearTimeout(timer)`           | 宿主 `clearTimeout`                        | 取消 `setTimeout` 返回的句柄；两个计时器适配器应成对覆盖 |
+
 ## 订阅
 
 ```ts
@@ -142,7 +172,7 @@ bus.emit('user:login', { id: 'Ada' });
 console.log((await login).payload.id);
 ```
 
-`waitFor` 返回事件上下文，结束后自动清理监听器、中止钩子和计时器。`filter` 默认接收所有负载，`replay` 默认为 `false`，不传 `timeout` 则不限时。超时必须是 `0` 至 `2147483647` 之间的有限毫秒数。超时以 `TimeoutError` 拒绝，中止以信号的 `reason` 拒绝。过滤函数抛错只拒绝等待，不使事件分发失败。`clear()`、总线销毁、所属作用域销毁会以 `AbortError` 拒绝尚未完成的等待。调用方需要处理 Promise 拒绝。
+`waitFor` 返回事件上下文，结束后自动清理监听器、中止钩子和计时器。`filter` 默认接收所有负载，`replay` 默认为 `false`，不传 `timeout` 则不限时。超时必须是 `0` 至 `2147483647` 之间的有限毫秒数。超时以 `TimeoutError` 拒绝，中止以信号的 `reason` 拒绝；当 `reason` 为 `undefined` 时回退为 `AbortError`。显式传入的 `null`、`false`、`0`、`''` 等原因会原样保留。过滤函数抛错只拒绝等待，不使事件分发失败。`clear()`、总线销毁、所属作用域销毁会以 `AbortError` 拒绝尚未完成的等待。调用方需要处理 Promise 拒绝。
 
 ## 保留与重放
 

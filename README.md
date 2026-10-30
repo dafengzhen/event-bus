@@ -28,6 +28,36 @@ off(); // idempotent
 
 `new EventBus<Events>(options)` is also available. Event maps can be interfaces or type aliases; no index signature is required. Exact keys support strings, numbers, and symbols. There is one payload per event; use an object or tuple when you need several values. Invalid keys, missing required payloads, and mismatched key/payload pairs are type errors.
 
+## Package entry points and compatibility
+
+| Entry point                    | ESM                                                             | CommonJS                                                             |
+| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `@dafengzhen/event-bus`        | `import { createEventBus } from '@dafengzhen/event-bus'`        | `const { createEventBus } = require('@dafengzhen/event-bus')`        |
+| `@dafengzhen/event-bus/legacy` | `import { createEventBus } from '@dafengzhen/event-bus/legacy'` | `const { createEventBus } = require('@dafengzhen/event-bus/legacy')` |
+
+Both entries expose the same API, with declarations for ESM and CommonJS.
+
+Both entries load the `core-js` `AggregateError` polyfill. `AbortController` must be available when creating a bus, either natively, through a polyfill, or through `platform.createAbortController`. `AbortSignal.any()` is not required. If `DOMException` is unavailable, cancellation and timeout errors fall back to `Error` objects with the appropriate `name`.
+
+### Host API overrides
+
+Use `platform` to adapt cancellation, errors, or timers to your host or test environment. Overrides are partial; the bus and all scopes created through `scope()` share the configured adapters.
+
+```ts
+const bus = createEventBus<Events>({
+  platform: {
+    createError: (message, name) => Object.assign(new Error(message), { name }),
+  },
+});
+```
+
+| `platform` member               | Default                                         | Contract                                                                          |
+| ------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------- |
+| `createAbortController()`       | `new AbortController()`                         | Return a compatible controller with a signal supporting abort event listeners     |
+| `createError(message, name)`    | `DOMException`, falling back to a named `Error` | Return an error named `AbortError` or `TimeoutError`                              |
+| `setTimeout(callback, timeout)` | Host `setTimeout`                               | Schedule asynchronously and return an opaque timer handle                         |
+| `clearTimeout(timer)`           | Host `clearTimeout`                             | Cancel the handle returned by `setTimeout`; override both timer adapters together |
+
 ## Subscribe
 
 ```ts
@@ -142,7 +172,7 @@ bus.emit('user:login', { id: 'Ada' });
 console.log((await login).payload.id);
 ```
 
-`waitFor` resolves to the event context and automatically removes its listener, abort hook, and timeout. `filter` defaults to accepting every payload, `replay` defaults to `false`, and no timeout is applied unless provided. Timeout must be a finite number from `0` to `2147483647` milliseconds. Timeout rejects with `TimeoutError`; abort rejects with the signal's reason. Filter exceptions reject the wait without failing the emission. `clear()`, bus disposal, and owning scope disposal reject pending waits with `AbortError`. Rejections from `waitFor` must be handled by the caller.
+`waitFor` resolves to the event context and automatically removes its listener, abort hook, and timeout. `filter` defaults to accepting every payload, `replay` defaults to `false`, and no timeout is applied unless provided. Timeout must be a finite number from `0` to `2147483647` milliseconds. Timeout rejects with `TimeoutError`; abort rejects with the signal's reason, falling back to `AbortError` when the reason is `undefined`. Explicit reasons such as `null`, `false`, `0`, and `''` are preserved. Filter exceptions reject the wait without failing the emission. `clear()`, bus disposal, and owning scope disposal reject pending waits with `AbortError`. Rejections from `waitFor` must be handled by the caller.
 
 ## Retain and replay
 
