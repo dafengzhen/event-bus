@@ -1,6 +1,6 @@
 {
   "name": "@dafengzhen/event-bus",
-  "version": "0.1.25",
+  "version": "0.1.26",
   "description": "A lightweight TypeScript event bus with strong typing, middleware pipeline, and pattern-based event listeners.",
   "keywords": [
     "event-bus",
@@ -27,11 +27,7 @@
     "dist"
   ],
   "type": "module",
-  "sideEffects": [
-    "**/polyfills.*",
-    "./dist/**/index.js",
-    "./dist/**/index.cjs"
-  ],
+  "sideEffects": false,
   "main": "./dist/cjs/modern/index.cjs",
   "module": "./dist/esm/modern/index.js",
   "types": "./dist/types/index.d.ts",
@@ -93,8 +89,7 @@
     "prepublishOnly": "run-s check"
   },
   "dependencies": {
-    "@dafengzhen/derivative-matcher": "^0.1.4",
-    "core-js": "^3.51.0"
+    "@dafengzhen/derivative-matcher": "^0.1.4"
   },
   "devDependencies": {
     "@commitlint/cli": "^21.2.4",
@@ -119,8 +114,5 @@
   },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
-  },
-  "allowScripts": {
-    "core-js@3.51.0": true
   }
 }

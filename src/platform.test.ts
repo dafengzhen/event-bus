@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import type { EventBusPlatform, Middleware } from './types.js';
+
 import { createEventBus } from './index.js';
+import { createPlatform } from './platform.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -40,9 +43,135 @@ describe('platform compatibility', () => {
     expect(child.disposed).toBe(true);
   });
 
-  it('explains how to supply an unavailable controller', () => {
+  it('prefers native controllers when available', () => {
+    expect(createPlatform().createAbortController()).toBeInstanceOf(AbortController);
+  });
+
+  it('prefers injected controllers even when native controllers are available', () => {
+    const controller = new AbortController();
+    const createAbortController = vi.fn<() => AbortController>(() => controller);
+    expect(createPlatform({ createAbortController }).createAbortController()).toBe(controller);
+    expect(createAbortController).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it('cancels the scope tree without DOM cancellation or event globals', async () => {
     vi.stubGlobal('AbortController', undefined);
-    expect(() => createEventBus()).toThrow('platform.createAbortController');
+    vi.stubGlobal('AbortSignal', undefined);
+    vi.stubGlobal('EventTarget', undefined);
+    vi.stubGlobal('Event', undefined);
+    vi.stubGlobal('DOMException', undefined);
+    const bus = createEventBus<{ ready: void }>();
+    const parent = bus.scope();
+    const child = parent.scope();
+    const listener = vi.fn<() => void>();
+    const middleware = vi.fn<Middleware<{ ready: void }>>((_, next) => next());
+    child.on('ready', listener);
+    child.use(middleware);
+    const pending = child.waitFor('ready');
+    bus.dispose();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(child.waitFor('ready')).rejects.toBe(child.signal.reason);
+    expect(parent.disposed).toBe(true);
+    expect(child.disposed).toBe(true);
+    expect(bus.listenerCount()).toBe(0);
+    expect(listener).not.toHaveBeenCalled();
+    expect(middleware).not.toHaveBeenCalled();
+    expect(() => child.signal.throwIfAborted()).toThrow(child.signal.reason);
+    expect(AbortController).toBeUndefined();
+  });
+
+  it('cleans up fallback scope hooks without cancelling siblings or the bus', async () => {
+    vi.stubGlobal('AbortController', undefined);
+    const bus = createEventBus<{ ready: void }>();
+    const scope = bus.scope();
+    const sibling = bus.scope();
+    const listener = vi.fn<() => void>();
+    const middleware = vi.fn<Middleware<{ ready: void }>>((_, next) => next());
+    scope.on('ready', listener);
+    scope.use(middleware);
+    const cancelled = scope.waitFor('ready');
+    const pending = sibling.waitFor('ready');
+    scope.dispose();
+    scope.dispose();
+    await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+    expect(bus.emit('ready').delivered).toBe(1);
+    await expect(pending).resolves.toMatchObject({ type: 'ready' });
+    expect(listener).not.toHaveBeenCalled();
+    expect(middleware).not.toHaveBeenCalled();
+    expect(sibling.disposed).toBe(false);
+    bus.dispose();
+  });
+
+  it.each([undefined, null, false, 0, '', 'cancelled'])(
+    'preserves fallback abort reason %s and only notifies once',
+    async (reason) => {
+      vi.stubGlobal('AbortController', undefined);
+      const createError = vi.fn<EventBusPlatform['createError']>(() => new Error('custom abort'));
+      const controller = createPlatform({ createError }).createAbortController();
+      const listener = vi.fn<(event: Event) => void>();
+      controller.signal.onabort = listener;
+      const bus = createEventBus<{ ready: void }>();
+      const pending = bus.waitFor('ready', { signal: controller.signal });
+      expect(() => controller.signal.throwIfAborted()).not.toThrow();
+      controller.abort(reason);
+      controller.abort('ignored');
+      const expected = reason === undefined ? createError.mock.results[0]!.value : reason;
+      await expect(pending).rejects.toBe(expected);
+      expect(controller.signal.reason).toBe(expected);
+      expect(listener).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          currentTarget: controller.signal,
+          target: controller.signal,
+          type: 'abort',
+        }),
+      );
+      bus.dispose();
+    },
+  );
+
+  it('honors fallback listener removal, deduplication, once, and listener objects', () => {
+    vi.stubGlobal('AbortController', undefined);
+    const { abort, signal } = createPlatform().createAbortController();
+    const removed = vi.fn<() => void>();
+    const once = vi.fn<() => void>();
+    const listener = { handleEvent: vi.fn<(event: Event) => void>() };
+    signal.addEventListener('abort', removed);
+    signal.removeEventListener('abort', removed, true);
+    signal.removeEventListener('abort', removed);
+    signal.addEventListener('abort', once, { once: true });
+    signal.addEventListener('abort', once);
+    signal.addEventListener('abort', listener);
+    abort();
+    signal.dispatchEvent(new Event('abort'));
+    expect(removed).not.toHaveBeenCalled();
+    expect(once).toHaveBeenCalledTimes(1);
+    expect(listener.handleEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it('continues fallback cancellation when an abort listener throws', () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('AbortController', undefined);
+    const bus = createEventBus<{ ready: void }>();
+    const parent = bus.scope();
+    parent.signal.addEventListener('abort', () => {
+      throw new Error('observer failed');
+    });
+    const child = parent.scope();
+    bus.dispose();
+    expect(child.disposed).toBe(true);
+    expect(() => vi.runAllTimers()).toThrow('observer failed');
+  });
+
+  it('skips fallback listeners removed during abort dispatch', () => {
+    vi.stubGlobal('AbortController', undefined);
+    const controller = createPlatform().createAbortController();
+    const listener = vi.fn<() => void>();
+    controller.signal.addEventListener('abort', () => {
+      controller.signal.removeEventListener('abort', listener);
+    });
+    controller.signal.addEventListener('abort', listener);
+    controller.abort();
+    expect(listener).not.toHaveBeenCalled();
   });
 
   it('preserves error names without DOMException, including old signals without reason', async () => {

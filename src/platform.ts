@@ -1,15 +1,14 @@
 import type { EventBusPlatform } from './types.js';
 
+import { createAbortController } from './abort-controller.js';
+
 export function createPlatform(options: Partial<EventBusPlatform> = {}): EventBusPlatform {
-  return {
+  const platform: EventBusPlatform = {
     clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
     createAbortController: () => {
-      if (typeof AbortController === 'undefined') {
-        throw new Error(
-          'AbortController is unavailable. Provide platform.createAbortController or load a polyfill.',
-        );
-      }
-      return new AbortController();
+      return typeof AbortController === 'function'
+        ? new AbortController()
+        : createAbortController(platform.createError);
     },
     createError: (message, name) => {
       if (typeof DOMException !== 'undefined') {
@@ -22,4 +21,5 @@ export function createPlatform(options: Partial<EventBusPlatform> = {}): EventBu
     setTimeout: (callback, timeout) => setTimeout(callback, timeout),
     ...options,
   };
+  return platform;
 }

@@ -37,7 +37,7 @@ off(); // idempotent
 
 Both entries expose the same API, with declarations for ESM and CommonJS.
 
-Both entries load the `core-js` `AggregateError` polyfill. `AbortController` must be available when creating a bus, either natively, through a polyfill, or through `platform.createAbortController`. `AbortSignal.any()` is not required. If `DOMException` is unavailable, cancellation and timeout errors fall back to `Error` objects with the appropriate `name`.
+Both entries use native `AggregateError`, supported by the target browsers and Node.js versions. Controllers are selected in this order: `platform.createAbortController`, native `AbortController`, then a built-in cancellation implementation for the bus and its scopes. The fallback does not modify global APIs or require `EventTarget`. `AbortSignal.any()` is not required. If `DOMException` is unavailable, cancellation and timeout errors fall back to `Error` objects with the appropriate `name`.
 
 ### Host API overrides
 
@@ -53,7 +53,7 @@ const bus = createEventBus<Events>({
 
 | `platform` member               | Default                                         | Contract                                                                          |
 | ------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------- |
-| `createAbortController()`       | `new AbortController()`                         | Return a compatible controller with a signal supporting abort event listeners     |
+| `createAbortController()`       | Native `AbortController`, or built-in fallback  | Return a compatible controller with a signal supporting abort event listeners     |
 | `createError(message, name)`    | `DOMException`, falling back to a named `Error` | Return an error named `AbortError` or `TimeoutError`                              |
 | `setTimeout(callback, timeout)` | Host `setTimeout`                               | Schedule asynchronously and return an opaque timer handle                         |
 | `clearTimeout(timer)`           | Host `clearTimeout`                             | Cancel the handle returned by `setTimeout`; override both timer adapters together |

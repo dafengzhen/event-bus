@@ -37,7 +37,7 @@ off(); // 多次调用安全
 
 两个入口提供相同 API，并分别提供 ESM 和 CommonJS 类型声明。
 
-两个入口都会加载 `core-js` 的 `AggregateError` 补丁。创建总线时必须有可用的 `AbortController`，可使用原生实现、polyfill 或 `platform.createAbortController`。无需 `AbortSignal.any()`。环境缺少 `DOMException` 时，取消和超时错误会回退为具有对应 `name` 的 `Error` 对象。
+两个入口均使用原生 `AggregateError`，目标浏览器和 Node.js 版本已支持该 API。控制器按以下优先级选择：`platform.createAbortController`、原生 `AbortController`、供总线及其作用域使用的内置取消实现。内置实现不会修改全局 API，也不依赖 `EventTarget`。无需 `AbortSignal.any()`。环境缺少 `DOMException` 时，取消和超时错误会回退为具有对应 `name` 的 `Error` 对象。
 
 ### 自定义宿主 API
 
@@ -51,12 +51,12 @@ const bus = createEventBus<Events>({
 });
 ```
 
-| `platform` 成员                 | 默认实现                                   | 要求                                                     |
-| ------------------------------- | ------------------------------------------ | -------------------------------------------------------- |
-| `createAbortController()`       | `new AbortController()`                    | 返回兼容的控制器，其信号支持中止事件监听                 |
-| `createError(message, name)`    | `DOMException`，不可用时回退为具名 `Error` | 返回名称为 `AbortError` 或 `TimeoutError` 的错误         |
-| `setTimeout(callback, timeout)` | 宿主 `setTimeout`                          | 异步调度回调，返回不透明计时器句柄                       |
-| `clearTimeout(timer)`           | 宿主 `clearTimeout`                        | 取消 `setTimeout` 返回的句柄；两个计时器适配器应成对覆盖 |
+| `platform` 成员                 | 默认实现                                     | 要求                                                     |
+| ------------------------------- | -------------------------------------------- | -------------------------------------------------------- |
+| `createAbortController()`       | 原生 `AbortController`，不可用时使用内置实现 | 返回兼容的控制器，其信号支持中止事件监听                 |
+| `createError(message, name)`    | `DOMException`，不可用时回退为具名 `Error`   | 返回名称为 `AbortError` 或 `TimeoutError` 的错误         |
+| `setTimeout(callback, timeout)` | 宿主 `setTimeout`                            | 异步调度回调，返回不透明计时器句柄                       |
+| `clearTimeout(timer)`           | 宿主 `clearTimeout`                          | 取消 `setTimeout` 返回的句柄；两个计时器适配器应成对覆盖 |
 
 ## 订阅
 

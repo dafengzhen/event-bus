@@ -1,5 +1,3 @@
-import './polyfills.js';
-
 export { createEventBus, EventBus } from './event-bus.js';
 export { EventScope } from './event-scope.js';
 export type {

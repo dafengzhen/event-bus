@@ -38,7 +38,7 @@ export interface EventBusOptions<E extends object> {
 export interface EventBusPlatform {
   /** Receives the opaque handle returned by setTimeout. */
   readonly clearTimeout: (timer: unknown) => void;
-  /** Supply a compatible controller in hosts without native AbortController. */
+  /** Defaults to native AbortController, or the built-in cancellation fallback. */
   readonly createAbortController: () => AbortController;
   /** Defaults to DOMException, or an Error with the same name when unavailable. */
   readonly createError: (message: string, name: 'AbortError' | 'TimeoutError') => Error;
